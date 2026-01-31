@@ -18,6 +18,8 @@ import os
 
 from packaging.version import parse as parse_version
 
+import mindrlhf
+
 from .protocol import DataProto
 from .utils.device import is_npu_available
 from .utils.import_utils import import_external_libs
@@ -101,3 +103,6 @@ if is_npu_available:
             device_module.synchronize()
 
         TensorDictBase._sync_all = _sync_all_patch
+
+if hasattr(mindrlhf, 'post_patch') and callable(mindrlhf.post_patch):
+    mindrlhf.post_patch()
