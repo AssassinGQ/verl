@@ -521,6 +521,145 @@ class RayPPOTrainer:
         # Log to each configured logger
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
+    def _dump_rollout_samples(self, gen_batch_output, original_batch):
+        """将rollout采样结果保存到文件，用于调试分析"""
+        import json
+        import os
+        from datetime import datetime
+        
+        # 创建输出目录
+        dump_dir = self.config.trainer.get("rollout_debug_dir", "/tmp/rollout_debug")
+        os.makedirs(dump_dir, exist_ok=True)
+        
+        # 只在前几个step保存详细样本
+        max_dump_steps = self.config.trainer.get("rollout_debug_max_steps", 5)
+        if self.global_steps >= max_dump_steps:
+            return
+        
+        responses = gen_batch_output.batch["responses"]
+        prompts = gen_batch_output.batch.get("prompts", None)
+        attention_mask = gen_batch_output.batch.get("attention_mask", None)
+        
+        # 计算统计信息
+        stats = {
+            "step": self.global_steps,
+            "timestamp": datetime.now().isoformat(),
+            "batch_size": len(responses),
+            "response_shape": list(responses.shape),
+        }
+        
+        # response长度统计
+        if attention_mask is not None and prompts is not None:
+            prompt_len = prompts.shape[1]
+            resp_mask = attention_mask[:, prompt_len:]
+            resp_lengths = resp_mask.sum(dim=-1).tolist()
+            stats["response_lengths"] = resp_lengths
+            stats["response_length_mean"] = sum(resp_lengths) / len(resp_lengths)
+            stats["response_length_max"] = max(resp_lengths)
+            stats["response_length_min"] = min(resp_lengths)
+            max_resp_len = responses.shape[1]
+            stats["clip_ratio"] = sum(1 for l in resp_lengths if l == max_resp_len) / len(resp_lengths)
+        
+        # EOS检查
+        eos_token_id = gen_batch_output.meta_info.get("eos_token_id", self.tokenizer.eos_token_id)
+        has_eos = (responses == eos_token_id).any(dim=-1).tolist()
+        stats["eos_token_id"] = eos_token_id
+        stats["samples_with_eos"] = sum(has_eos)
+        stats["eos_ratio"] = sum(has_eos) / len(has_eos)
+        
+        # 保存详细样本（前10个）
+        samples = []
+        num_samples = min(10, len(responses))
+        for i in range(num_samples):
+            sample = {}
+            
+            # prompt
+            if prompts is not None:
+                prompt_text = self.tokenizer.decode(prompts[i], skip_special_tokens=False)
+                sample["prompt"] = prompt_text
+                sample["prompt_ids"] = prompts[i].tolist()[:50]  # 前50个token
+            
+            # response
+            resp_text = self.tokenizer.decode(responses[i], skip_special_tokens=False)
+            sample["response"] = resp_text
+            sample["response_ids"] = responses[i].tolist()[:50]  # 前50个token
+            sample["has_eos"] = has_eos[i]
+            
+            # ground_truth (如果有)
+            if "reward_model" in original_batch.non_tensor_batch:
+                gt = original_batch.non_tensor_batch["reward_model"]
+                if isinstance(gt, list) and i < len(gt):
+                    sample["ground_truth"] = gt[i].get("ground_truth", "N/A") if isinstance(gt[i], dict) else str(gt[i])
+            
+            # data_source (如果有)
+            if "data_source" in original_batch.non_tensor_batch:
+                ds = original_batch.non_tensor_batch["data_source"]
+                if isinstance(ds, (list, np.ndarray)) and i < len(ds):
+                    sample["data_source"] = str(ds[i])
+            
+            samples.append(sample)
+        
+        stats["samples"] = samples
+        
+        # 保存到文件
+        output_file = os.path.join(dump_dir, f"rollout_step_{self.global_steps:04d}.json")
+        with open(output_file, "w", encoding="utf-8") as f:
+            json.dump(stats, f, ensure_ascii=False, indent=2)
+        
+        # 同时打印摘要到控制台
+        pprint(f"[ROLLOUT DEBUG] Step {self.global_steps}: saved to {output_file}")
+        pprint(f"  response_length: mean={stats.get('response_length_mean', 'N/A'):.1f}, "
+               f"max={stats.get('response_length_max', 'N/A')}, min={stats.get('response_length_min', 'N/A')}")
+        pprint(f"  clip_ratio: {stats.get('clip_ratio', 'N/A'):.2%}")
+        pprint(f"  eos_ratio: {stats['eos_ratio']:.2%} ({stats['samples_with_eos']}/{len(has_eos)})")
+
+    def _dump_reward_result(self, batch, reward_tensor, reward_extra_infos_dict):
+        """将reward计算结果保存到文件"""
+        import json
+        import os
+        
+        # 只在前几个step保存
+        max_dump_steps = self.config.trainer.get("rollout_debug_max_steps", 5)
+        if self.global_steps >= max_dump_steps:
+            return
+        
+        dump_dir = self.config.trainer.get("rollout_debug_dir", "/tmp/rollout_debug")
+        os.makedirs(dump_dir, exist_ok=True)
+        
+        # 统计信息
+        nonzero_rewards = reward_tensor[reward_tensor != 0]
+        stats = {
+            "step": self.global_steps,
+            "reward_shape": list(reward_tensor.shape),
+            "reward_sum": reward_tensor.sum().item(),
+            "reward_mean": reward_tensor.mean().item(),
+            "nonzero_count": len(nonzero_rewards),
+            "total_elements": reward_tensor.numel(),
+            "nonzero_ratio": len(nonzero_rewards) / reward_tensor.numel() if reward_tensor.numel() > 0 else 0,
+        }
+        
+        if len(nonzero_rewards) > 0:
+            stats["nonzero_mean"] = nonzero_rewards.mean().item()
+            stats["nonzero_max"] = nonzero_rewards.max().item()
+            stats["nonzero_min"] = nonzero_rewards.min().item()
+        
+        # 每个样本的reward (sum over sequence)
+        sample_rewards = reward_tensor.sum(dim=-1).tolist()
+        stats["sample_rewards"] = sample_rewards
+        
+        # extra info
+        if reward_extra_infos_dict:
+            stats["reward_extra_info_keys"] = list(reward_extra_infos_dict.keys())
+        
+        # 保存到文件
+        output_file = os.path.join(dump_dir, f"reward_step_{self.global_steps:04d}.json")
+        with open(output_file, "w", encoding="utf-8") as f:
+            json.dump(stats, f, ensure_ascii=False, indent=2)
+        
+        # 打印摘要
+        pprint(f"[REWARD DEBUG] Step {self.global_steps}: saved to {output_file}")
+        pprint(f"  reward_sum: {stats['reward_sum']:.4f}, nonzero: {stats['nonzero_count']}/{stats['total_elements']} ({stats['nonzero_ratio']:.1%})")
+
     def _compute_or_extract_reward(
         self,
         batch: DataProto,
@@ -1365,6 +1504,10 @@ class RayPPOTrainer:
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
 
+                    # 保存rollout采样结果到文件，用于调试
+                    if "responses" in gen_batch_output.batch:
+                        self._dump_rollout_samples(gen_batch_output, batch)
+
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:
                             raise ValueError("A reward_fn is required for REMAX advantage estimation.")
@@ -1495,6 +1638,9 @@ class RayPPOTrainer:
                         if self.config.reward_model.launch_reward_fn_async:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
                         batch.batch["token_level_scores"] = reward_tensor
+                        
+                        # 保存reward结果到文件
+                        self._dump_reward_result(batch, reward_tensor, reward_extra_infos_dict)
 
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})

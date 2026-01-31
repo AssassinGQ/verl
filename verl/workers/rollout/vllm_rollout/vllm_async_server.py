@@ -257,6 +257,15 @@ class vLLMHttpServerBase:
             repetition_penalty=1.0,
             max_new_tokens=self.config.response_length,
         )
+        logger.info("="*80)
+        logger.info("[VLLM ROLLOUT SAMPLING CONFIG]")
+        logger.info(f"  temperature: {self.config.temperature}")
+        logger.info(f"  top_k: {self.config.top_k}")
+        logger.info(f"  top_p: {self.config.top_p}")
+        logger.info(f"  repetition_penalty: 1.0")
+        logger.info(f"  max_new_tokens: {self.config.response_length}")
+        logger.info(f"  ignore_eos: {self.config.ignore_eos}")
+        logger.info("="*80)
         logger.info(f"override_generation_config: {override_generation_config}")
 
         logger.info(f"enable_sleep_mode: {self.config.enable_sleep_mode}")
