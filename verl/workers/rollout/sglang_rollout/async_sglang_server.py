@@ -181,6 +181,7 @@ class SGLangHttpServer:
         # used for http server
         self._server_address = ray.util.get_node_ip_address().strip("[]")
         self._server_port = None
+        self._kv_events_endpoints = None
 
         # used for controlling sglang server profiler
         profiler_config = self.config.profiler
@@ -215,6 +216,24 @@ class SGLangHttpServer:
         """Get http server address and port."""
         assert self._server_port is not None, "http server is not launched, port is None"
         return self._server_address, self._server_port
+
+    def get_kv_events_endpoints(self):
+        """Get kv-events ZMQ endpoint addresses.
+
+        Returns list [endpoint, replay_endpoint] or None if kv-events
+        are not configured.  Mirrors vllm
+        ``vllm_async_server.py:get_kv_events_endpoints``.
+        """
+        return self._kv_events_endpoints
+
+    def get_rollout_config(self):
+        """Get the RolloutConfig (e.g. max_num_seqs, max_model_len).
+
+        Lets external routers fetch server-side config via the same
+        handler-getter pattern as ``get_server_address``.  Mirrors vllm
+        ``vllm_async_server.py:get_rollout_config``.
+        """
+        return self.config
 
     async def set_pd_peer(self, decode_peers: list, bootstrap_host: str):
         assert isinstance(decode_peers, list) and decode_peers
@@ -253,6 +272,12 @@ class SGLangHttpServer:
                 self._master_port = master_port
 
         engine_kwargs = self.config.get("engine_kwargs", {}).get("sglang", {}) or {}
+        # Extract kv-events-config before spreading engine_kwargs to ServerArgs,
+        # mirroring vllm _preprocess_engine_kwargs.  kv-events-config uses CLI
+        # dashes (--kv-events-config), not underscores, so it can't be passed
+        # directly as a constructor kwarg (ServerArgs.kv_events_config expects
+        # a JSON string).  We pop it, resolve free ports, and set it explicitly.
+        _kv_events_config = engine_kwargs.pop("kv-events-config", None)
         attention_backend = engine_kwargs.pop("attention_backend", None)
         mm_attention_backend = engine_kwargs.pop("mm_attention_backend", None)
         if attention_backend is None:
@@ -384,6 +409,23 @@ class SGLangHttpServer:
         sglang.srt.entrypoints.engine._set_envs_and_config = _set_envs_and_config
         os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
         server_args = ServerArgs(**args)
+
+        # Process kv-events config: resolve free ports to avoid conflicts across
+        # replicas, inject the JSON string into ServerArgs, and store endpoints
+        # for get_kv_events_endpoints() (mirrors vllm _preprocess_engine_kwargs).
+        if _kv_events_config and isinstance(_kv_events_config, dict):
+            endpoints = []
+            for key, default in [("endpoint", "tcp://*:5557"), ("replay_endpoint", "tcp://*:5558")]:
+                ep = _kv_events_config.get(key, default)
+                if "tcp" in ep and ":" in ep:
+                    idx = ep.rfind(":")
+                    addr = ep[:idx]
+                    free_port, _ = get_free_port(self._server_address)
+                    _kv_events_config[key] = f"{addr}:{free_port}"
+                    endpoints.append(f"{self._server_address}:{free_port}")
+            server_args.kv_events_config = json.dumps(_kv_events_config)
+            self._kv_events_endpoints = endpoints
+
         # For SGLang main branch or version >= 0.5.10
         # The latest main branch of SGLang has wrapped the _launch_subprocesses function inside the Engine class
         if version.parse(sglang.__version__) >= version.parse("0.5.10"):
