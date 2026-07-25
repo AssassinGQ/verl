@@ -37,6 +37,7 @@ for var_name in DATA_PATH MODEL_PATH AGENT_CONFIG; do
 done
 
 python "${SCRIPT_DIR}/parallel_infer.py" \
+    --response-length "${RESPONSE_LENGTH:-4096}" \
     --data-path "${DATA_PATH}" \
     --model-path "${MODEL_PATH}" \
     --agent-config-path "${AGENT_CONFIG}" \

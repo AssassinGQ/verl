@@ -397,5 +397,234 @@ class TestRoutePanel:
         panels = pm.build_panels(560.0)
         route_panels = [p for p in panels if isinstance(p, pm.RouteLatencyPanel)]
         assert len(route_panels) == 1
-        # route-latency is panel 16 of 18 (RouteLoadPanel, StickyOverloadPanel after it)
-        assert isinstance(panels[-3], pm.RouteLatencyPanel)
+        # RouteLoadPanel retired — the per-replica load now comes from the
+        # strategy ``score():`` line as a ScoreFieldPanel keyed route_load_scored.
+        load_panel = next(p for p in panels if p.key == "route_load_scored")
+        assert isinstance(load_panel, pm.ScoreFieldPanel)
+        assert load_panel.hline == 0.9  # default load_threshold mirrors the old RouteLoadPanel
+        # the full score-component set is wired (load + s_cache + inflight + capacity 4)
+        assert {
+            "route_load_scored",
+            "s_cache",
+            "inflight",
+            "avail",
+            "need",
+            "inflight_tokens",
+            "remaining",
+        } <= {p.key for p in panels}
+
+
+# ── LogParser: strategy score(): line (prefix-load-aware + capacity-token-aware) ─
+
+
+def _score_pla_line(
+    rep: str,
+    *,
+    kv: float,
+    run: int,
+    wait: int,
+    inflight: int | None,
+    load: float,
+    s_load: float,
+    gpu_hit: float,
+    s_cache: float,
+    score: float = 0.2,
+    offset_s: int = 0,
+) -> str:
+    """A prefix-load-aware ``score(): replica=...`` line.
+
+    ``inflight=None`` omits the fragment (older ``uni_agent`` logs predate the
+    inflight term); the regex group is optional either way.
+    """
+    ts = (T0 + _td(offset_s)).strftime("%Y-%m-%d %H:%M:%S")
+    inflight_frag = f" inflight={inflight}" if inflight is not None else ""
+    return (
+        f"{ts} INFO strategy score(): replica={rep} kv={kv} running={run} waiting={wait}"
+        f"{inflight_frag} → load={load:.4f} s_load={s_load:.4f} | gpu_hit={gpu_hit:.2f}"
+        f" s_cache={s_cache:.4f} (0.30·cache + 0.70·load) → score={score:.4f}"
+    )
+
+
+def _score_cap_line(
+    rep: str,
+    *,
+    kv_perc: float,
+    gpu_hit: float,
+    inflight: int,
+    avail: float,
+    need: float,
+    mbt,
+    inflight_tokens: int,
+    remaining: float,
+    offset_s: int = 0,
+    winner: bool = False,
+) -> str:
+    """A capacity-token-aware ``score(): replica=...`` line (winner tag optional)."""
+    ts = (T0 + _td(offset_s)).strftime("%Y-%m-%d %H:%M:%S")
+    tag = " ← WINNER" if winner else ""
+    return (
+        f"{ts} INFO strategy score(): replica={rep} kv_perc={kv_perc:.3f} gpu_hit={gpu_hit:.3f}"
+        f" inflight={inflight} avail={avail:.0f} need={need:.0f} max_num_batched_tokens={mbt}"
+        f" inflight_tokens={inflight_tokens} remaining={remaining:.0f}{tag}"
+    )
+
+
+class TestScoreParsing:
+    def test_is_signal_matches_score_line(self):
+        assert pm.LogParser.is_signal(
+            _score_pla_line("s0", kv=0.1, run=1, wait=0, inflight=2, load=0.25, s_load=0.75, gpu_hit=0.5, s_cache=0.35)
+        )
+        assert pm.LogParser.is_signal(
+            _score_cap_line(
+                "s0",
+                kv_perc=0.1,
+                gpu_hit=0.5,
+                inflight=2,
+                avail=1000,
+                need=100,
+                mbt=8192,
+                inflight_tokens=200,
+                remaining=800,
+            )
+        )
+
+    def test_parse_score_pla_fields(self):
+        line = _score_pla_line(
+            "8.92.9.147:41425",
+            kv=0.12,
+            run=4,
+            wait=1,
+            inflight=3,
+            load=0.25,
+            s_load=0.75,
+            gpu_hit=0.50,
+            s_cache=0.35,
+            offset_s=5,
+        )
+        ts, kind, g = pm.LogParser.parse(line)
+        assert kind == "score_pla"
+        assert ts == T0 + _td(5)
+        assert g["rep"] == "8.92.9.147:41425"
+        assert g["load"] == "0.2500"
+        assert g["s_cache"] == "0.3500"
+        assert g["inflight"] == "3"
+
+    def test_parse_score_pla_without_inflight(self):
+        # Older uni_agent logs omit inflight — the group must be optional.
+        line = _score_pla_line(
+            "s0", kv=0.0, run=0, wait=0, inflight=None, load=0.0, s_load=1.0, gpu_hit=0.0, s_cache=0.0
+        )
+        _, kind, g = pm.LogParser.parse(line)
+        assert kind == "score_pla"
+        assert g["inflight"] is None
+        assert g["load"] == "0.0000"
+
+    def test_parse_score_cap_fields(self):
+        line = _score_cap_line(
+            "s1",
+            kv_perc=0.123,
+            gpu_hit=0.450,
+            inflight=3,
+            avail=12345,
+            need=678,
+            mbt=8192,
+            inflight_tokens=2048,
+            remaining=9999,
+            offset_s=2,
+            winner=True,
+        )
+        ts, kind, g = pm.LogParser.parse(line)
+        assert kind == "score_cap"
+        assert ts == T0 + _td(2)
+        assert g["rep"] == "s1"
+        assert g["avail"] == "12345"
+        assert g["need"] == "678"
+        assert g["inflight_tokens"] == "2048"
+        assert g["remaining"] == "9999"
+
+    def test_combined_scores_line_not_matched_as_score(self):
+        # The aggregate "score(): COMBINED scores:" line carries no replica= field
+        # and must NOT be captured by the score parser.
+        line = f"{T0.strftime('%Y-%m-%d %H:%M:%S')} INFO strategy score(): COMBINED scores: s0=0.2, s1=0.3"
+        assert pm.LogParser.parse(line) is None
+
+
+# ── collect(): score() lines → per-replica ScoreFieldPanel series ───────────
+
+
+class TestScoreCollect:
+    def test_collect_feeds_score_pla_panels(self, tmp_path):
+        log = tmp_path / "s.log"
+        log.write_text(
+            _score_pla_line(
+                "s0", kv=0.1, run=1, wait=0, inflight=2, load=0.25, s_load=0.75, gpu_hit=0.5, s_cache=0.35, offset_s=0
+            )
+            + "\n"
+            + _score_pla_line(
+                "s0", kv=0.2, run=2, wait=1, inflight=3, load=0.40, s_load=0.60, gpu_hit=0.6, s_cache=0.42, offset_s=1
+            )
+            + "\n"
+        )
+        bundle = pm.collect([str(log)], pm.build_panels(560.0))
+        assert [p[1] for p in bundle.series["route_load_scored"]["s0"]] == [0.25, 0.40]
+        assert [p[1] for p in bundle.series["s_cache"]["s0"]] == [0.35, 0.42]
+        assert [p[1] for p in bundle.series["inflight"]["s0"]] == [2.0, 3.0]
+        assert bundle.n_score == 2
+        assert bundle.replicas == {"s0"}
+
+    def test_collect_feeds_score_cap_panels(self, tmp_path):
+        log = tmp_path / "c.log"
+        log.write_text(
+            _score_cap_line(
+                "s1",
+                kv_perc=0.1,
+                gpu_hit=0.5,
+                inflight=3,
+                avail=1000,
+                need=100,
+                mbt=8192,
+                inflight_tokens=200,
+                remaining=800,
+                offset_s=0,
+            )
+            + "\n"
+        )
+        bundle = pm.collect([str(log)], pm.build_panels(560.0))
+        assert [p[1] for p in bundle.series["avail"]["s1"]] == [1000.0]
+        assert [p[1] for p in bundle.series["need"]["s1"]] == [100.0]
+        assert [p[1] for p in bundle.series["inflight_tokens"]["s1"]] == [200.0]
+        assert [p[1] for p in bundle.series["remaining"]["s1"]] == [800.0]
+
+    def test_evidence_panels_not_contaminated_by_score_line(self, tmp_path):
+        # CRITICAL: evidence and prefix score lines BOTH carry kv/run/wait. The
+        # evidence-derived panels (run/wait/kv-load) must come ONLY from evidence
+        # lines — the score-line run/wait must NOT double-count into them.
+        log = tmp_path / "m.log"
+        log.write_text(
+            _score_pla_line(
+                "s0", kv=0.1, run=9, wait=9, inflight=2, load=0.25, s_load=0.75, gpu_hit=0.5, s_cache=0.35, offset_s=0
+            )
+            + "\n"
+        )
+        bundle = pm.collect([str(log)], pm.build_panels(560.0))
+        assert not bundle.series.get("run", {}).get("s0")  # score-line run=9 leaked?
+        assert not bundle.series.get("wait", {}).get("s0")  # score-line wait=9 leaked?
+        # the score-line load lands in route_load_scored, NOT the evidence KV-load panel.
+        assert not bundle.series.get("load", {}).get("s0")
+        assert [p[1] for p in bundle.series["route_load_scored"]["s0"]] == [0.25]
+
+
+# ── StickyOverloadPanel: derive_loads (is_overload buffer only) ─────────────
+
+
+class TestStickyOverloadPanel:
+    def test_derive_loads_single_arg_is_overload(self):
+        # After RouteLoadPanel retired, derive_loads takes only the is_overload
+        # buffer (route_load arg dropped) and copies it verbatim per replica.
+        panel = pm.StickyOverloadPanel(load_threshold=0.9)
+        is_overload = {"s0": [(T0, 0.3), (T0 + _td(1), 0.4)], "s1": [(T0, 0.95)]}
+        assert panel.derive_loads(is_overload) == {
+            "s0": [(T0, 0.3), (T0 + _td(1), 0.4)],
+            "s1": [(T0, 0.95)],
+        }
+        assert panel.derive_loads({}) is None  # empty → None (panel hidden)
