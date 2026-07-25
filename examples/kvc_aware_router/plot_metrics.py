@@ -42,18 +42,33 @@ repeats down the figure so the eye tracks one replica vertically:
                                  (per-replica) — request-size signal seen at dispatch
  16. route latency             — balancer route() scoring latency per dispatch
                                  (global single line; one point per acquire_server)
- 17. route load (scored)       — per-replica load that drove the combined-score
-                                 dispatch (all replicas; one point per dispatch)
- 18. load (sticky overload chk)— load of the sticky-bound replica evaluated in
+ 17. route load (scored)       — per-replica combined load (a·kv + b·run/max +
+                                 c·wait/max + d·inflight/max) that drove the dispatch,
+                                 from the prefix-load-aware score() line (all replicas)
+ 18. s_cache                   — per-replica 3-layer prefix-cache hit score (prefix path)
+ 19. inflight                  — per-replica acquire/release inflight count (score() line)
+ 20. avail tokens              — per-replica free tokens cap·(1-kv_perc) (capacity path)
+ 21. need tokens               — per-replica prefill tokens this req adds, plen·(1-gpu_hit)
+                                 (capacity path)
+ 22. inflight tokens           — per-replica inflight token count (capacity path)
+ 23. remaining tokens          — per-replica free tokens after assign (capacity path);
+                                 the routing signal under capacity-token-aware
+ 24. load (sticky overload chk)— load of the sticky-bound replica evaluated in
                                  is_overloaded (one replica per sticky dispatch)
 
-Panels 1–15 are per-replica (one line each); panels 17–18 are also per-replica
-(instantaneous, one point per dispatch). Panel 16 (route latency) is a single
-global line — route() is a balancer-wide call, not per-replica. Panels 10–15
-derive from the ``router-dispatch`` loguru line; panels 17–18 derive from
-``route-load loads={...}`` and ``is-overload replica=... load=...`` lines
-emitted by the kvcaware strategy — absent on sticky-win / least-inflight
-dispatches, so the panels are skipped when the log has no such lines.
+Panels 1–15 are per-replica (one line each); panels 17–23 are also per-replica
+(instantaneous score components, one point per dispatch from the strategy
+``score(): replica=...`` line). Panel 16 (route latency) is a single global line
+— route() is a balancer-wide call, not per-replica. Panels 10–15 derive from the
+``router-dispatch`` loguru line; panels 17–23 derive from the ``score():`` line
+emitted inside the kvcaware strategy's score() loop — prefix-load-aware yields
+load / s_cache / inflight, capacity-token-aware yields avail / need /
+inflight_tokens / remaining (only one path is active per run, so the other four
+stay empty); panel 24 derives from ``is-overload replica=... load=...``. The
+score() line is the per-replica breakdown the strategy already logs each
+dispatch — including the older ``uni_agent`` logs that predate the separate
+``route-load`` dict line, which is why load is sourced from score() (not the
+retired route-load dict): it shows on old logs too.
 
 The panel hierarchy captures the reusable shapes under the leaf panels:
 :class:`SlidingPanel` (a windowed per-interval rate — :class:`MFUPanel` is its
@@ -61,16 +76,20 @@ throughput instance), :class:`CumulativePanel` (a running total folded from
 tally history — :class:`EvictPanel` is its drop-counter instance),
 :class:`TrailingDeltaPanel` (a trailing-window aggregate of the per-replica
 dispatch counters — dispatched/completed/avg-turn/RPM/avg-prompt-len are its
-instances), and :class:`LoadPanel` (per-replica instantaneous load from
-route-load / is-overload lines — panels 17–18 are its instances).
+instances), and :class:`ScoreFieldPanel` (per-replica instantaneous
+score-component from the strategy ``score():`` line — load / s_cache / inflight
+/ avail / need / inflight_tokens / remaining are its instances; the per-replica
+load it carries replaced the retired route-load dict panel).
 
 Sources are the ``vllm-evidence ...``, ``kv-events tally: ... retained_blocks/replica=...``,
 ``router-dispatch replica=... ...``, ``... routed to server=... route=<ms> ...``,
-``route-load loads={...}``, and ``is-overload replica=... load=...``
-loguru lines emitted by the kvcaware collector/balancer/strategy (parsed by :class:`LogParser`).
-``usage=`` and ``flops=`` are optional
-(older logs parse fine; those panels stay empty). LLM decode is bandwidth-bound,
-so MFU is naturally low (10-40%) in decode-heavy phases — expected, not idle.
+``score(): replica=... ...`` (prefix-load-aware + capacity-token-aware), and
+``is-overload replica=... load=...`` loguru lines emitted by the kvcaware
+collector/balancer/strategy (parsed by :class:`LogParser`). ``usage=`` and
+``flops=`` are optional; the score line's ``inflight`` is optional too (older
+``uni_agent`` logs parse fine; the panels that have no matching line stay empty).
+LLM decode is bandwidth-bound, so MFU is naturally low (10-40%) in decode-heavy
+phases — expected, not idle.
 
 Usage:
     python plot_metrics.py LOG [LOG ...]
@@ -98,7 +117,8 @@ _DISPATCH_WINDOW_S = 300.0
 _TITLE = (
     "KV Load / usage / MFU / run / wait / evictions / prefix-hit / prefill-recompute / "
     "external-hit / dispatched / completed / cumul-completed / avg-turn / RPM / "
-    "avg-prompt-len / route-latency / route-load-scored / sticky-overload-load (time-aligned)"
+    "avg-prompt-len / route-latency / route-load-scored / s_cache / inflight / "
+    "avail / need / inflight-tokens / remaining / sticky-overload-load (time-aligned)"
 )
 
 
@@ -131,8 +151,9 @@ class LogParser:
     """Parses kvcaware-collector loguru lines into ``(ts, kind, fields)``.
 
     ``kind`` is ``'evidence'`` / ``'tally'`` / ``'dispatch'`` / ``'route'`` /
-    ``'route_load'`` / ``'is_overload'``; ``fields`` is the regex groupdict;
-    ``ts`` may be None (the caller skips it to keep the time axis honest).
+    ``'score_pla'`` (prefix-load-aware) / ``'score_cap'`` (capacity-token-aware)
+    / ``'is_overload'``; ``fields`` is the regex groupdict; ``ts`` may be None
+    (the caller skips it to keep the time axis honest).
     """
 
     # vllm-evidence replica=X kv=0.021 usage=0.450 run=240 wait=12 | TTFT=.. .. |
@@ -161,10 +182,26 @@ class LogParser:
     # request=<uuid> routed to server=<addr> (ranking=.., pool=.., route=<ms>, strategy=[..])
     # route= is the per-dispatch route() scoring latency in ms; one line per acquire_server.
     _ROUTE = re.compile(r"routed to server=(?P<srv>\S+).*?route=(?P<route>[\d.]+)ms")
-    # route-load loads={'s0': 0.4213, 's1': 0.1822} — per-replica load (all replicas) that drove
-    # a combined-score dispatch, emitted once per such dispatch from score(). dict form mirrors
-    # the tally line (ast.literal_eval). Absent on sticky-win / least-inflight dispatches.
-    _ROUTE_LOAD = re.compile(r"route-load\s+loads=(?P<d>\{[^}]*\})")
+    # score(): replica=<id> kv=.. running=.. waiting=.. [inflight=..] → load=.. s_load=.. |
+    #   gpu_hit=.. s_cache=.. (..·cache + ..·load) → score=..   (prefix-load-aware path).
+    # Per-replica score breakdown emitted inside score()'s loop. ``inflight`` is optional —
+    # older ``uni_agent`` logs predate the inflight term. Drives the load / s_cache / inflight
+    # panels (the per-replica load here replaces the retired route-load dict line).
+    _SCORE_PLA = re.compile(
+        r"score\(\):\s+replica=(?P<rep>\S+)\s+kv=(?P<kv>\S+)\s+running=(?P<run>\d+)"
+        r"\s+waiting=(?P<wait>\d+)(?:\s+inflight=(?P<inflight>\d+))?"
+        r"\s+→\s+load=(?P<load>[\d.]+)\s+s_load=(?P<s_load>[\d.]+)"
+        r"\s+\|\s+gpu_hit=(?P<gpu_hit>[\d.]+)\s+s_cache=(?P<s_cache>[\d.]+)"
+    )
+    # score(): replica=<id> kv_perc=.. gpu_hit=.. inflight=.. avail=.. need=..
+    #   max_num_batched_tokens=.. inflight_tokens=.. remaining=.. [← WINNER]  (capacity-token path)
+    _SCORE_CAP = re.compile(
+        r"score\(\):\s+replica=(?P<rep>\S+)\s+kv_perc=(?P<kv_perc>[\d.]+)"
+        r"\s+gpu_hit=(?P<gpu_hit>[\d.]+)\s+inflight=(?P<inflight>\d+)"
+        r"\s+avail=(?P<avail>[\d.]+)\s+need=(?P<need>[\d.]+)"
+        r"\s+max_num_batched_tokens=(?P<mbt>\S+)\s+inflight_tokens=(?P<inflight_tokens>[\d,]+)"
+        r"\s+remaining=(?P<remaining>[-\d.]+)"
+    )
     # is-overload replica=<id> load=<val> — the load of the sticky-bound replica that the
     # overload check (is_overloaded) evaluated, one replica per sticky-check dispatch.
     _IS_OVERLOAD = re.compile(r"is-overload\s+replica=(?P<rep>\S+)\s+load=(?P<load>[\d.]+)")
@@ -176,7 +213,7 @@ class LogParser:
         "retained_blocks/replica=",
         "router-dispatch",
         "routed to server",
-        "route-load loads=",
+        "score(): replica=",
         "is-overload replica=",
     )
 
@@ -199,9 +236,12 @@ class LogParser:
         m = cls._ROUTE.search(line)
         if m:
             return cls._ts(line), "route", m.groupdict()
-        m = cls._ROUTE_LOAD.search(line)
+        m = cls._SCORE_PLA.search(line)
         if m:
-            return cls._ts(line), "route_load", m.groupdict()
+            return cls._ts(line), "score_pla", m.groupdict()
+        m = cls._SCORE_CAP.search(line)
+        if m:
+            return cls._ts(line), "score_cap", m.groupdict()
         m = cls._IS_OVERLOAD.search(line)
         if m:
             return cls._ts(line), "is_overload", m.groupdict()
@@ -280,11 +320,11 @@ class Panel:
         """
         return None
 
-    def derive_loads(self, route_load, is_overload):
-        """Build the series from the route-load / is-overload buffers; default None.
+    def derive_loads(self, is_overload):
+        """Build the series from the is-overload buffer; default None.
 
-        Both buffers are ``{replica: [(ts, load), ...]}``. Load panels override
-        this, picking one buffer via ``self.source``. Default None so the main
+        ``is_overload`` is ``{replica: [(ts, load), ...]}``. Load panels
+        (:class:`StickyOverloadPanel`) override this. Default None so the main
         loop can call it uniformly on every panel.
         """
         return None
@@ -377,6 +417,22 @@ class FieldPanel(Panel):
             return self._value(fields)
         v = fields.get(self._value)
         return Panel.to_float(v) if v is not None else None
+
+
+class ScoreFieldPanel(FieldPanel):
+    """Per-replica score-component panel fed from the strategy ``score():`` line.
+
+    Same per-line extraction shape as :class:`FieldPanel`, but sourced from the
+    kvcaware strategy's per-dispatch ``score(): replica=...`` log (prefix-load-
+    aware / capacity-token-aware) instead of ``vllm-evidence``. Exists as a type
+    marker so :func:`collect` can route score() lines to these panels through a
+    dedicated extraction loop — kept strictly separate from the evidence loop
+    because the prefix score line also carries ``kv``/``running``/``waiting``
+    field names, and feeding it through the evidence loop would double-count the
+    evidence-derived KV-load / run / wait panels.
+    """
+
+    pass
 
 
 class SlidingPanel(Panel):
@@ -699,38 +755,7 @@ class RouteLatencyPanel(Panel):
         return self._summary(pts) if self._summary else ""
 
 
-class LoadPanel(Panel):
-    """Base for per-replica load panels fed from route-load / is-overload buffers.
-
-    Subclasses set ``source`` to ``"route_load"`` or ``"is_overload"``; the
-    common :meth:`derive_loads` hook picks the right buffer.  Both draw one
-    line per replica (instantaneous load ∈ [0,1]) and a horizontal line at the
-    overload threshold — each subclass's ``__init__`` sets ``hline``.
-    """
-
-    source: str  # set by subclass: "route_load" or "is_overload"
-
-    def derive_loads(self, route_load, is_overload):
-        buf = route_load if self.source == "route_load" else is_overload
-        return {rep: list(pts) for rep, pts in buf.items()} or None
-
-
-class RouteLoadPanel(LoadPanel):
-    """Per-replica load that drove the combined-score dispatch (all replicas)."""
-
-    def __init__(self, *, load_threshold: float, **kw):
-        super().__init__(
-            "route_load_scored",
-            f"route load (scored)\n(threshold={load_threshold:.2f})",
-            ylim_top=1.0,
-            hline=load_threshold,
-            summary=Panel.last("rload", ".3f"),
-            **kw,
-        )
-        self.source = "route_load"
-
-
-class StickyOverloadPanel(LoadPanel):
+class StickyOverloadPanel(Panel):
     """Load of the sticky-bound replica evaluated in is_overloaded (one replica per dispatch)."""
 
     def __init__(self, *, load_threshold: float, **kw):
@@ -742,7 +767,9 @@ class StickyOverloadPanel(LoadPanel):
             summary=Panel.last("sload", ".3f"),
             **kw,
         )
-        self.source = "is_overload"
+
+    def derive_loads(self, is_overload):
+        return {rep: list(pts) for rep, pts in is_overload.items()} or None
 
 
 def build_panels(peak_tflops: float, load_threshold: float = 0.9) -> list[Panel]:
@@ -801,8 +828,64 @@ def build_panels(peak_tflops: float, load_threshold: float = 0.9) -> list[Panel]
         RPMPanel(height=2.0),
         AvgPromptLenPanel(height=2.0),
         RouteLatencyPanel(height=2.0),
-        # ── Per-replica per-dispatch load panels (one line per replica) ──
-        RouteLoadPanel(height=2.0, load_threshold=load_threshold),
+        # ── Per-replica score-component panels (one line per replica, from the
+        #    strategy score() line). prefix-load-aware path first (load / s_cache /
+        #    inflight), then the capacity-token-aware quartet (avail / need /
+        #    inflight_tokens / remaining). ``route_load_scored`` replaces the retired
+        #    route-load dict panel — same key/threshold, now sourced from score() so
+        #    the older uni_agent logs (no route-load line) still show it. ──
+        ScoreFieldPanel(
+            "route_load_scored",
+            f"route load (scored)\n(threshold={load_threshold:.2f})",
+            "load",
+            height=2.0,
+            ylim_top=1.0,
+            hline=load_threshold,
+            summary=Panel.last("rload", ".3f"),
+        ),
+        ScoreFieldPanel(
+            "s_cache",
+            "s_cache\n(3-layer prefix cache hit)",
+            "s_cache",
+            height=2.0,
+            ylim_top=1.0,
+            summary=Panel.rng("s_cache", ".3f"),
+        ),
+        ScoreFieldPanel(
+            "inflight",
+            "inflight\n(acquire/release count)",
+            "inflight",
+            height=2.0,
+            summary=Panel.last("inflight", ".0f"),
+        ),
+        ScoreFieldPanel(
+            "avail",
+            "avail tokens\n(cap·(1-kv_perc))",
+            "avail",
+            height=2.0,
+            summary=Panel.last("avail", ".0f"),
+        ),
+        ScoreFieldPanel(
+            "need",
+            "need tokens\n(plen·(1-gpu_hit))",
+            "need",
+            height=2.0,
+            summary=Panel.last("need", ".0f"),
+        ),
+        ScoreFieldPanel(
+            "inflight_tokens",
+            "inflight tokens",
+            "inflight_tokens",
+            height=2.0,
+            summary=Panel.last("inflight_tokens", ".0f"),
+        ),
+        ScoreFieldPanel(
+            "remaining",
+            "remaining tokens\n(avail-need + cap-inflight_tokens)",
+            "remaining",
+            height=2.0,
+            summary=Panel.last("remaining", ".0f"),
+        ),
         StickyOverloadPanel(height=2.0, load_threshold=load_threshold),
     ]
 
@@ -815,7 +898,6 @@ class Bundle:
         retained,
         dispatch,
         route_lat,
-        route_load,
         is_overload,
         replicas,
         t_min,
@@ -826,7 +908,7 @@ class Bundle:
         n_tally,
         n_dispatch,
         n_route,
-        n_route_load,
+        n_score,
         n_is_overload,
         n_no_ts,
     ):
@@ -834,7 +916,6 @@ class Bundle:
         self.retained = retained  # {replica: [(ts, n), ...]}
         self.dispatch = dispatch  # {replica: [(ts, dispatched, completed, turn_sum, prompt_len_sum), ...]}
         self.route_lat = route_lat  # [(ts, ms), ...] global flat — route() is balancer-wide
-        self.route_load = route_load  # {replica: [(ts, load), ...]} — score() combined-path per-replica load
         self.is_overload = is_overload  # {replica: [(ts, load), ...]} — is_overloaded() bound-replica load
         self.replicas = replicas
         self.t_min = t_min
@@ -848,7 +929,7 @@ class Bundle:
         self.n_tally = n_tally
         self.n_dispatch = n_dispatch
         self.n_route = n_route
-        self.n_route_load = n_route_load
+        self.n_score = n_score  # strategy score() lines parsed (prefix + capacity)
         self.n_is_overload = n_is_overload
         self.n_no_ts = n_no_ts
 
@@ -866,20 +947,31 @@ def collect(paths, panels: list[Panel]) -> Bundle:
         p
         for p in panels
         if not isinstance(
-            p, CumulativePanel | TrailingDeltaPanel | RouteLatencyPanel | CumulativeCompletedPanel | LoadPanel
+            p,
+            CumulativePanel
+            | TrailingDeltaPanel
+            | RouteLatencyPanel
+            | CumulativeCompletedPanel
+            | ScoreFieldPanel
+            | StickyOverloadPanel,
         )
     ]
-    series = {p.key: defaultdict(list) for p in extract_panels}
+    # Score-component panels (load / s_cache / inflight / capacity 4) are fed from
+    # the strategy ``score():`` line via their own extraction loop below. Kept out
+    # of extract_panels so the evidence loop never runs them — the evidence and
+    # prefix score lines both carry kv/running/waiting, and feeding score lines
+    # through the evidence loop would double-count the KV-load / run / wait panels.
+    score_panels = [p for p in panels if isinstance(p, ScoreFieldPanel)]
+    series = {p.key: defaultdict(list) for p in (*extract_panels, *score_panels)}
     retained: dict = defaultdict(list)
     dispatch: dict = defaultdict(list)
     route_lat: list = []
-    route_load: dict = defaultdict(list)
     is_overload: dict = defaultdict(list)
     replicas: set[str] = set()
     t_min = t_max = None
     # Walltime window — first/last timestamp across ALL lines (true run span).
     log_t_min = log_t_max = None
-    n_ev = n_tally = n_dispatch = n_route = n_route_load = n_is_overload = n_no_ts = 0
+    n_ev = n_tally = n_dispatch = n_route = n_score = n_is_overload = n_no_ts = 0
 
     for path in paths:
         try:
@@ -943,15 +1035,14 @@ def collect(paths, panels: list[Panel]) -> Bundle:
                 elif kind == "route":  # global per-dispatch latency (not per-replica)
                     route_lat.append((ts, float(g["route"])))
                     n_route += 1
-                elif kind == "route_load":  # score() combined-path per-replica load snapshot
-                    try:
-                        d = ast.literal_eval(g["d"])
-                    except Exception:
-                        continue
-                    for rep, load in d.items():
-                        replicas.add(rep)
-                        route_load[rep].append((ts, float(load)))
-                    n_route_load += 1
+                elif kind in ("score_pla", "score_cap"):  # strategy score() per-replica breakdown
+                    rep = g["rep"]
+                    replicas.add(rep)
+                    for p in score_panels:
+                        v = p.extract(g)
+                        if v is not None:
+                            series[p.key][rep].append((ts, v))
+                    n_score += 1
                 elif kind == "is_overload":  # is_overloaded() bound-replica load check
                     rep = g["rep"]
                     replicas.add(rep)
@@ -963,7 +1054,6 @@ def collect(paths, panels: list[Panel]) -> Bundle:
         retained,
         dispatch,
         route_lat,
-        route_load,
         is_overload,
         replicas,
         t_min,
@@ -974,7 +1064,7 @@ def collect(paths, panels: list[Panel]) -> Bundle:
         n_tally,
         n_dispatch,
         n_route,
-        n_route_load,
+        n_score,
         n_is_overload,
         n_no_ts,
     )
@@ -1037,7 +1127,7 @@ def print_summary(
 ) -> None:
     print(
         f"OK: {bundle.n_ev} evidence lines, {bundle.n_tally} tally lines, "
-        f"{bundle.n_dispatch} dispatch lines, {bundle.n_route_load} route-load lines, "
+        f"{bundle.n_dispatch} dispatch lines, {bundle.n_score} score lines, "
         f"{bundle.n_is_overload} is-overload lines, {len(bundle.replicas)} replicas -> {out}"
     )
     print(f"   peak={peak_tflops:.0f} TFLOPS/NPU, mfu_window={_MFU_WINDOW_S:.0f}s, max cum evictions={max_evict}")
@@ -1110,7 +1200,7 @@ def main(argv=None) -> int:
         derived_rt = p.derive_route(bundle.route_lat)
         if derived_rt is not None:
             bundle.series[p.key] = derived_rt
-        derived_loads = p.derive_loads(bundle.route_load, bundle.is_overload)
+        derived_loads = p.derive_loads(bundle.is_overload)
         if derived_loads is not None:
             bundle.series[p.key] = derived_loads
 
