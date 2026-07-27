@@ -118,6 +118,8 @@ def init_config(args: argparse.Namespace) -> DictConfig:
         strat0.slow_cut = args.slow_cut
     if args.overload_mode is not None:
         strat0.overload_mode = args.overload_mode
+    if args.do_shortcut is not None:
+        strat0.do_shortcut = args.do_shortcut
 
     return config
 
@@ -326,6 +328,13 @@ def main():
         choices=["None", "kv_cache_usage_perc", "kv_load"],
         default=None,
         help="KVCAware strategy[0] overload_mode for the sticky short-circuit ",
+    )
+    parser.add_argument(
+        "--do-shortcut",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="KVCAware strategy[0] do_shortcut master switch for the sticky short-circuit. "
+        "Use --do-shortcut to enable, --no-do-shortcut to disable. Overrides kvcaware.yaml when set.",
     )
 
     args = parser.parse_args()
