@@ -50,6 +50,7 @@ class KVCacheAwareStrategy:
         collector_names: list[str],
         weight: float,
         memory_overload_filter: bool = True,
+        do_shortcut: bool = True,
         slow_cut: SlowCut | str = SlowCut.PREFIX_LOAD_AWARE,
         load_weights: tuple[float, float, float, float] = DEFAULT_LOAD_WEIGHTS,
         overload_mode: OverloadMode | str = OverloadMode.KV_LOAD,
@@ -69,6 +70,8 @@ class KVCacheAwareStrategy:
             raise StrategyError(f"layer_weights values must sum to 1.0, got {weights_sum}")
         if not isinstance(memory_overload_filter, bool):
             raise StrategyError(f"memory_overload_filter must be a bool, got {memory_overload_filter!r}")
+        if not isinstance(do_shortcut, bool):
+            raise StrategyError(f"do_shortcut must be a bool, got {do_shortcut!r}")
         try:
             slow_cut = SlowCut(slow_cut)
         except ValueError as exc:
@@ -90,6 +93,7 @@ class KVCacheAwareStrategy:
         self.collector_names = collector_names
         self.weight = weight
         self.memory_overload_filter = memory_overload_filter
+        self.do_shortcut = do_shortcut
         self.slow_cut = slow_cut
         self.load_weights = tuple(load_weights)
         self.overload_mode = overload_mode
@@ -98,8 +102,8 @@ class KVCacheAwareStrategy:
         logger.info(
             f"KVCacheAwareStrategy created: alpha={self.alpha:.2f}, "
             f"load_threshold={self.load_threshold:.2f}, load_weights={self.load_weights}, "
-            f"memory_overload_filter={self.memory_overload_filter}, slow_cut={self.slow_cut.value}, "
-            f"overload_mode={self.overload_mode.value}"
+            f"memory_overload_filter={self.memory_overload_filter}, do_shortcut={self.do_shortcut}, "
+            f"slow_cut={self.slow_cut.value}, overload_mode={self.overload_mode.value}"
         )
 
     def set_capacity(self, max_num_seqs: int, max_num_batched_tokens: int) -> None:
@@ -126,6 +130,7 @@ class KVCacheAwareStrategy:
             collector_names=cfg.collector_names,
             weight=cfg.weight,
             memory_overload_filter=cfg.memory_overload_filter,
+            do_shortcut=cfg.do_shortcut,
             slow_cut=cfg.slow_cut,
             overload_mode=cfg.overload_mode,
         )
@@ -239,16 +244,36 @@ class KVCacheAwareStrategy:
         if not replicas:
             return []
         # Sticky short-circuit.
-        shortcut = self._sticky_shortcut(store, replicas, request_id)
-        if shortcut is not None:
-            return shortcut
+        shortcut: list[float] | None = None
+        if self.do_shortcut:
+            shortcut = self._sticky_shortcut(store, replicas, request_id)
+            if shortcut is not None:
+                return shortcut
         if self.slow_cut == SlowCut.LEAST_INFLIGHT:
             return [-store.get_metric(r.replica_id, MetricKey.INFLIGHT_COUNT) for r in replicas]
+        if self.slow_cut == SlowCut.PREFIX_LOAD_AWARE:
+            return self._prefix_load_aware(store, replicas, prompt_ids or [])
         if self.slow_cut == SlowCut.CAPACITY_TOKEN_AWARE:
             return self._capacity_token_scores(store, replicas, prompt_ids or [])
-        effective_prompt_ids = prompt_ids or []
+        raise ValueError(f"Unknow slowcut type {self.slow_cut}")
 
-        result = []
+    def _prefix_load_aware(
+        self,
+        store: DataStore,
+        replicas: list[ReplicaInfo],
+        effective_prompt_ids: list[int],
+    ) -> list[float]:
+        """Prefix-cache + blended-load combined score (``slow_cut=prefix-load-aware``).
+
+            S = α·S_cache + (1-α)·S_load
+
+        ``S_cache`` is the three-layer weighted prefix-hit score;
+        ``S_load = 1 - load`` where ``load`` blends kv_usage /
+        running / waiting / inflight via ``_compute_load``.
+
+        Returns one score per replica
+        """
+        result: list[float] = []
         loads: dict[str, float] = {}
         for replica in replicas:
             m = store.get_metrics(replica.replica_id)
@@ -326,11 +351,12 @@ class KVCacheAwareStrategy:
 
             avail[i]     = cap × (1 - kv_cache_usage_perc[i])   # free tokens (no cache)
             need[i]      = len(prompt_ids) × (1 - gpu_hit[i])    # prefill this req adds
-            remaining[i] = (avail[i] - need[i]) + (cap - infight_tokens).  # free tokens after assign
+            remaining[i] = avail[i] - need[i]                    # free tokens after assign
             eligible[i]  = avail[i] >= cap × (1 - load_threshold)   # pure capacity gate
 
-        Pick ``argmax(eligible, remaining)``; cold start (``kv_cache_usage_perc`` all
-        ≈ 0) falls back to least-inflight;
+        pick ``argmin(inflight_tokens)`` (least in-flight tokens wins) to keep
+        the first wave from collapsing onto ``pool[0]``.
+        Otherwise pick ``argmax(eligible, remaining)``.
         """
         n = len(replicas)
         cap = self._total_token_capacity(store)
@@ -343,7 +369,7 @@ class KVCacheAwareStrategy:
             s_cache, gpu_hit = self._cache_score(store, replica, prompt_ids)
             avail = cap * (1.0 - kv_perc)
             need = plen * (1.0 - gpu_hit)
-            remaining = (avail - need) + (cap - inflight_tokens)
+            remaining = avail - need
             rows.append(
                 {
                     "replica": replica,
@@ -359,12 +385,17 @@ class KVCacheAwareStrategy:
             )
 
         thresh = cap * (1.0 - self.load_threshold)
-        eligible = [i for i in range(n) if rows[i]["avail"] >= thresh]
-        if not eligible:
-            top = max(range(n), key=lambda i: rows[i]["remaining"])
-            logger.info("score(): CAPACITY_TOKEN_AWARE no eligible → max remaining")
+        cold_start = cap <= 0 or all(row["kv_perc"] <= 1e-6 for row in rows)
+        if cold_start:
+            top = min(range(n), key=lambda i: rows[i]["inflight_tokens"])
+            logger.info("score(): CAPACITY_TOKEN_AWARE cold start → min inflight_tokens")
         else:
-            top = max(eligible, key=lambda i: rows[i]["remaining"])
+            eligible = [i for i in range(n) if rows[i]["avail"] >= thresh]
+            if not eligible:
+                top = max(range(n), key=lambda i: rows[i]["remaining"])
+                logger.info("score(): CAPACITY_TOKEN_AWARE no eligible → max remaining")
+            else:
+                top = max(eligible, key=lambda i: rows[i]["remaining"])
 
         for i, row in enumerate(rows):
             tag = " ← WINNER" if i == top else ""

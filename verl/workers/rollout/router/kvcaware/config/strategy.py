@@ -39,6 +39,8 @@ class KVCAwareStrategyConfig(StrategyConfig):
     # Sticky short-circuit: when True, a returning session is sent back to its
     # bound replica only if that replica is NOT overloaded (load > load_threshold).
     memory_overload_filter: bool = True
+    # Master switch for the sticky short-circuit.
+    do_shortcut: bool = True
     # Fallback scoring mode used after the sticky short-circuit misses.
     slow_cut: SlowCut = SlowCut.PREFIX_LOAD_AWARE
     # Overload check mode for the sticky short-circuit (independent of slow_cut).
@@ -52,6 +54,8 @@ class KVCAwareStrategyConfig(StrategyConfig):
             raise ConfigError(f"load_threshold must be in (0, 1), got {self.load_threshold}")
         if not isinstance(self.memory_overload_filter, bool):
             raise ConfigError(f"memory_overload_filter must be a bool, got {self.memory_overload_filter!r}")
+        if not isinstance(self.do_shortcut, bool):
+            raise ConfigError(f"do_shortcut must be a bool, got {self.do_shortcut!r}")
         # Normalize yaml str → SlowCut (also validates the value is a known mode).
         try:
             self.slow_cut = SlowCut(self.slow_cut)
