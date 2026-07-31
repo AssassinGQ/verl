@@ -14,6 +14,6 @@
 
 """Utility functions."""
 
-from .hash import compute_hash, get_prefix_hashes
+from .hash import compute_hash, get_prefix_hashes_incremental
 
-__all__ = ["compute_hash", "get_prefix_hashes"]
+__all__ = ["compute_hash", "get_prefix_hashes_incremental"]

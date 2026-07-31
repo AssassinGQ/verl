@@ -20,7 +20,7 @@ import pytest
 
 from verl.workers.rollout.router.kvcaware.store.kv_cache_store import KVCacheStore
 from verl.workers.rollout.router.kvcaware.types import Layer
-from verl.workers.rollout.router.kvcaware.utils.hash import get_prefix_hashes
+from verl.workers.rollout.router.kvcaware.utils.hash import get_prefix_hashes_incremental
 
 pytestmark = [pytest.mark.ut, pytest.mark.cpu]
 
@@ -37,10 +37,11 @@ def _store_with_block_size() -> KVCacheStore:
 
 def _hashes(prompt_ids: list[int]) -> list[str]:
     """Prefix hashes for ``prompt_ids`` as the store keys them (str)."""
-    return [str(h) for h in get_prefix_hashes(prompt_ids, BLOCK_SIZE, SEED)]
+    hashes, _ = get_prefix_hashes_incremental(prompt_ids, BLOCK_SIZE, SEED, 0, SEED)
+    return [str(h) for h in hashes]
 
 
-# ── 1. Chain property of get_prefix_hashes ──────────────────────────────
+# ── 1. Chain property of the chained prefix hash ────────────────────────
 
 
 def test_chained_hashes_are_cumulative() -> None:
@@ -81,9 +82,10 @@ def test_max_contiguous_match_per_replica() -> None:
     store.add_blocks("rep_b", [h1, h2])
     store.add_blocks("rep_c", [h1, h2, h3])
 
-    assert store.get_layer_prefix_hit_rate("rep_a", prompt, Layer.GPU) == 1.0  # 4/4
-    assert store.get_layer_prefix_hit_rate("rep_b", prompt, Layer.GPU) == 0.5  # 2/4
-    assert store.get_layer_prefix_hit_rate("rep_c", prompt, Layer.GPU) == 0.75  # 3/4
+    hash_strs = _hashes(prompt)
+    assert store.get_layer_prefix_hit_rate("rep_a", hash_strs, Layer.GPU) == 1.0  # 4/4
+    assert store.get_layer_prefix_hit_rate("rep_b", hash_strs, Layer.GPU) == 0.5  # 2/4
+    assert store.get_layer_prefix_hit_rate("rep_c", hash_strs, Layer.GPU) == 0.75  # 3/4
 
 
 # ── 3. Chain break stops at first missing block ─────────────────────────
@@ -110,8 +112,9 @@ def test_chain_break_stops_at_first_missing_block() -> None:
     # rep_a gaps H4 → contiguous chain breaks at H4 → 3/5 (the prefix it
     # actually shares), not 5/5. A real chained cache cannot hold H5 without
     # H4 (H5's hash embeds H4), so the contiguous scan is the correct hit.
-    assert store.get_layer_prefix_hit_rate("rep_a", prompt, Layer.GPU) == 0.6  # 3/5
-    assert store.get_layer_prefix_hit_rate("rep_b", prompt, Layer.GPU) == 1.0  # 5/5
+    hash_strs = _hashes(prompt)
+    assert store.get_layer_prefix_hit_rate("rep_a", hash_strs, Layer.GPU) == 0.6  # 3/5
+    assert store.get_layer_prefix_hit_rate("rep_b", hash_strs, Layer.GPU) == 1.0  # 5/5
 
 
 # ── 4. The "telemetry noise" failure mode is already prevented ──────────
@@ -138,4 +141,4 @@ def test_isolated_later_block_is_not_credited() -> None:
 
     # rep_a caches only unrelated hashes; prompt's H1 has no rep_a → chain
     # breaks immediately → 0.0 hit.
-    assert store.get_layer_prefix_hit_rate("rep_a", prompt, Layer.GPU) == 0.0
+    assert store.get_layer_prefix_hit_rate("rep_a", _hashes(prompt), Layer.GPU) == 0.0
