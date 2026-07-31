@@ -257,7 +257,7 @@ class KVCacheAwareStrategy:
         if self.slow_cut == SlowCut.PREFIX_LOAD_AWARE:
             return self._prefix_load_aware(store, replicas, gpu_hash_strs)
         if self.slow_cut == SlowCut.CAPACITY_TOKEN_AWARE:
-            return self._capacity_token_scores(store, replicas, prompt_ids or [], gpu_hash_strs)
+            return self._capacity_token_scores(store, replicas, request_id, prompt_ids or [], gpu_hash_strs)
         raise ValueError(f"Unknow slowcut type {self.slow_cut}")
 
     def _prefix_load_aware(
@@ -346,6 +346,7 @@ class KVCacheAwareStrategy:
         self,
         store: DataStore,
         replicas: list[ReplicaInfo],
+        request_id: str | None,
         prompt_ids: list[int],
         gpu_hash_strs: list[str],
     ) -> list[float]:
@@ -389,7 +390,7 @@ class KVCacheAwareStrategy:
             )
 
         thresh = cap * (1.0 - self.load_threshold)
-        cold_start = cap <= 0 or all(row["kv_perc"] <= 1e-6 for row in rows)
+        cold_start = store.get_sticky_binding(request_id) is None
         if cold_start:
             top = min(range(n), key=lambda i: rows[i]["inflight_tokens"])
             logger.info("score(): CAPACITY_TOKEN_AWARE cold start → min inflight_tokens")
