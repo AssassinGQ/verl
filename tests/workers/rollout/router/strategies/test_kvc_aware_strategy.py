@@ -95,6 +95,7 @@ class FakeRouteDataProvider:
     def __init__(self, data: dict[str, dict], sticky: dict[str, str] | None = None):
         self._data = data
         self._sticky = sticky or {}
+        self._per_request: dict[str, dict] = {}
 
     def get_sticky_binding(self, request_id: str) -> str | None:
         return self._sticky.get(request_id)
@@ -123,7 +124,7 @@ class FakeRouteDataProvider:
             MetricKey.INFLIGHT_COUNT: entry.get("inflight_count", 0),
         }
 
-    def get_layer_prefix_hit_rate(self, replica_id: str, prompt_ids: list[int], layer: str) -> float:
+    def get_layer_prefix_hit_rate(self, replica_id: str, hash_strs: list[str], layer: str = Layer.GPU) -> float:
         entry = self._data.get(replica_id, {})
         if layer == Layer.GPU:
             return entry.get("gpu_hit_pct", 0) / 100.0
@@ -140,6 +141,12 @@ class FakeRouteDataProvider:
     def get_block_size(self) -> int | None:
         # Block size is learned from KV events; tests default to vLLM's 16.
         return 16
+
+    def get_per_request(self, request_id: str, key: str, default=None):
+        return self._per_request.get(request_id, {}).get(key, default)
+
+    def set_per_request(self, request_id: str, key: str, value) -> None:
+        self._per_request.setdefault(request_id, {})[key] = value
 
 
 class ConstantStrategy:
@@ -490,21 +497,14 @@ class TestKVCAwareCacheScore:
         s_cache, _ = strat._cache_score(provider, ReplicaInfo("rep"), PROMPT_IDS)
         assert s_cache == pytest.approx(0.70)
 
-    def test_gpu_only_when_tier_none(self):
+    def test_gpu_only_when_tiers_zero(self):
         """
-        Feature: None tier hit rate is treated as 0.0
-        Description: provider returns None for tiers (mooncake placeholder); gpu_hit_pct=80
+        Feature: GPU-only contribution when tiers report no hit
+        Description: gpu_hit_pct=80, cpu/ssd tiers empty (0.0 today — not wired)
         Expectation: 0.7*0.8 + 0 + 0 = 0.56
         """
-
-        class _NoneProvider(FakeRouteDataProvider):
-            def get_layer_prefix_hit_rate(self, replica_id, prompt_ids, layer):
-                if layer == Layer.GPU:
-                    return super().get_layer_prefix_hit_rate(replica_id, prompt_ids, layer)
-                return None
-
         strat = _strat()
-        provider = _NoneProvider({"rep": {"gpu_hit_pct": 80, "tiers": {}}})
+        provider = FakeRouteDataProvider({"rep": {"gpu_hit_pct": 80, "tiers": {}}})
         s_cache, _ = strat._cache_score(provider, ReplicaInfo("rep"), PROMPT_IDS)
         assert s_cache == pytest.approx(0.56)
 
@@ -566,22 +566,14 @@ class TestKVCAwareTierWeights:
         assert scores == pytest.approx([0.324, 0.296])
         assert scores[0] > scores[1]
 
-    def test_tier_none_treated_as_zero(self):
+    def test_tier_zero_contributes_nothing(self):
         """
-        Feature: None return from get_layer_prefix_hit_rate is treated as 0.0
-        Description: provider returns None for cpu/ssd layer hit rate
-        Expectation: score = (1-α)·s_load (S_cache=0), no TypeError
-          rep: load=0.2→s_load=0.8; s_cache=0; score=0.3·0.8=0.24
+        Feature: zero tier hit rates contribute nothing to S_cache
+        Description: cpu/ssd tiers empty (0.0 today); gpu_hit_pct=0 → S_cache=0
+        Expectation: score = (1-α)·s_load; rep: load=0.2→s_load=0.8; score=0.3·0.8=0.24
         """
-
-        class _NoneProvider(FakeRouteDataProvider):
-            def get_layer_prefix_hit_rate(self, replica_id, prompt_ids, layer):
-                if layer == Layer.GPU:
-                    return super().get_layer_prefix_hit_rate(replica_id, prompt_ids, layer)
-                return None
-
         strat = _strat()
-        provider = _NoneProvider(
+        provider = FakeRouteDataProvider(
             {
                 "rep": {
                     "kv_cache_usage_perc": 0.5,

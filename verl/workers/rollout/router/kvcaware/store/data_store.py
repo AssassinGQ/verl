@@ -155,20 +155,25 @@ class DataStore:
     def get_layer_prefix_hit_rate(
         self,
         node_id: str,
-        prompt_ids: list[int],
+        hash_strs: list[str],
         layer: Layer = Layer.GPU,
     ) -> float:
         """Query prefix-cache hit rate for a node at a given layer.
 
         Args:
             node_id: Target node.
-            prompt_ids: Current request's prompt token IDs.
+            hash_strs: Precomputed ``str(h)`` chain of the prompt's full-block
+                prefix hashes (computed once by the caller and shared across
+                replicas/layers).
             layer: Cache layer (``Layer.GPU``/``Layer.CPU``/``Layer.SSD``).
+
+        Only the GPU layer is backed by a reverse index today; CPU/SSD return
+        0.0 (see ``KVCacheStore.get_layer_prefix_hit_rate``).
 
         Returns:
             Hit rate 0.0–1.0.
         """
-        return self._kv.get_layer_prefix_hit_rate(node_id, prompt_ids, layer)
+        return self._kv.get_layer_prefix_hit_rate(node_id, hash_strs, layer)
 
     # ── KV-cache load (load signal) ─────────────────────────────────────
 
@@ -252,3 +257,11 @@ class DataStore:
     def get_per_request(self, request_id: str, key: str, default: Any = None):
         """Return one per-request value (``default`` if unset/evicted)."""
         return self._per_request.get(request_id, key, default)
+
+    def set_per_request(self, request_id: str, key: str, value: Any) -> None:
+        """Set one per-request value (creates the row if new)."""
+        self._per_request.set(request_id, key, value)
+
+    def del_per_request(self, request_id: str, key: str) -> None:
+        """Drop one per-request value (no-op if absent)."""
+        self._per_request.delete(request_id, key)

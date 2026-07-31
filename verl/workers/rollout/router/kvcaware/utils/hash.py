@@ -50,45 +50,45 @@ def compute_hash(parent_hash: int, block_bytes: bytes, seed: int = 0) -> int:
     return h.intdigest()
 
 
-def get_prefix_hashes(
+def get_prefix_hashes_incremental(
     prompt_ids: list[int],
     block_size: int,
+    parent_hash: int,
+    n_done: int,
     seed: int = 0,
-) -> list[int]:
-    """Compute prefix hash sequence for prompt token IDs.
+) -> tuple[list[int], int]:
+    """Continue a chained-prefix-hash computation from a checkpoint.
 
-    Algorithm (matching aibrix ``SyncPrefixHashTable.GetPrefixHashes``):
-        parent_hash = seed
-        for each full block:
-            block_bytes = encode tokens as uint32 big-endian
-            current_hash = compute_hash(parent_hash, block_bytes, seed)
-            parent_hash = current_hash
-
-    Only full blocks (exactly ``block_size`` tokens) are hashed.
-    Partial blocks at the tail are ignored.
+    Given the chain head ``parent_hash`` (= the hash of block ``n_done - 1``,
+    or ``seed`` when ``n_done == 0``) and the number of blocks ``n_done``
+    already hashed, hash only blocks ``[n_done, n_full_blocks)`` and append.
+    The chain is deterministic, so the appended hashes are byte-identical to
+    what a full computation from scratch would have produced.
 
     Args:
-        prompt_ids: Prompt token IDs as ``list[int]``.
-        block_size: Number of tokens per block (must be > 0).
-        seed: xxhash seed value. Defaults to ``0``.
+        prompt_ids: Prompt token IDs (the full, current-turn prompt).
+        block_size: Tokens per block (must match the checkpoint's block_size).
+        parent_hash: Chain head at block ``n_done`` (hash of block n_done-1,
+            or ``seed`` when ``n_done == 0``).
+        n_done: Number of leading blocks already hashed (the checkpoint).
+        seed: xxhash seed (must match the original full computation).
 
     Returns:
-        List of prefix hashes as ``int`` (one per full block).
+        ``(appended_hashes, final_parent_hash)`` where ``appended_hashes``
+        covers only blocks ``[n_done, n_full_blocks)`` (empty when the prompt
+        did not grow past the checkpoint) and ``final_parent_hash`` is the new
+        chain head to cache for the next turn. Concatenate
+        ``existing_hashes + appended_hashes`` for the full hash sequence.
     """
     if block_size <= 0:
         raise ValueError(f"block_size must be > 0, got {block_size}")
-
     n_full_blocks = len(prompt_ids) // block_size
-    hashes: list[int] = []
-    parent_hash = seed
-
-    for i in range(n_full_blocks):
+    appended: list[int] = []
+    cur = parent_hash
+    for i in range(n_done, n_full_blocks):
         start = i * block_size
         end = start + block_size
-        block_tokens = prompt_ids[start:end]
-        block_bytes = struct.pack(f">{block_size}I", *block_tokens)
-        current_hash = compute_hash(parent_hash, block_bytes, seed)
-        hashes.append(current_hash)
-        parent_hash = current_hash
-
-    return hashes
+        block_bytes = struct.pack(f">{block_size}I", *prompt_ids[start:end])
+        cur = compute_hash(cur, block_bytes, seed)
+        appended.append(cur)
+    return appended, cur

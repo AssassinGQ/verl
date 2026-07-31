@@ -20,7 +20,6 @@ import threading
 from collections.abc import Iterable
 
 from ..types import Layer
-from ..utils.hash import get_prefix_hashes
 
 
 class KVCacheStore:
@@ -117,24 +116,38 @@ class KVCacheStore:
 
     # ── Prefix hit rate queries ─────────────────────────────────────────
 
-    def get_layer_prefix_hit_rate(self, node_id: str, prompt_ids: list[int], layer: Layer = Layer.GPU) -> float:
+    def get_layer_prefix_hit_rate(
+        self,
+        node_id: str,
+        hash_strs: list[str],
+        layer: Layer = Layer.GPU,
+    ) -> float:
         """Prefix-cache hit rate for a node at a layer, ∈ [0.0, 1.0].
 
         GPU: walk the local reverse index (``replicas_by_block``) along the
-        prompt's prefix-hash chain until a hash isn't cached on this node.
-        CPU/SSD: placeholder 0.0 (mooncake /batch_query not wired yet).
+        supplied ``hash_strs`` chain until a hash isn't cached on this node.
+
+        CPU/SSD return 0.0 today — not just because the mooncake collector is
+        unwired, but because ``add_blocks`` only indexes GPU blocks into
+        ``replicas_by_block`` (CPU/SSD are counted in ``_replica_layer_counts``
+        only). Supporting CPU/SSD hit queries requires extending the reverse
+        index to be layer-keyed (``dict[Layer, dict[str, set[str]]]``) and
+        indexing those blocks in ``add_blocks``; until then ``layer`` here is a
+        placeholder that short-circuits to 0.0.
         """
+        if layer != Layer.GPU or self.block_size is None:
+            return 0.0
         with self._lock:
-            if layer != Layer.GPU or self.block_size is None:
-                return 0.0
-            prefix_hashes = get_prefix_hashes(prompt_ids, self.block_size)
-            if not prefix_hashes:
-                return 0.0
-            hash_strs = [str(h) for h in prefix_hashes]
-            matched = 0
-            for i, hs in enumerate(hash_strs):
-                cached = self.replicas_by_block.get(hs)
-                if cached is None or node_id not in cached:
-                    break  # chain break — this node doesn't cache this hash
-                matched = i + 1
-            return matched / len(hash_strs)
+            return self._gpu_hit_rate_locked(node_id, hash_strs)
+
+    def _gpu_hit_rate_locked(self, node_id: str, hash_strs: list[str]) -> float:
+        """Walk the reverse index along the hash chain. Caller holds ``_lock``."""
+        if not hash_strs:
+            return 0.0
+        matched = 0
+        for i, hs in enumerate(hash_strs):
+            cached = self.replicas_by_block.get(hs)
+            if cached is None or node_id not in cached:
+                break  # chain break — this node doesn't cache this hash
+            matched = i + 1
+        return matched / len(hash_strs)
