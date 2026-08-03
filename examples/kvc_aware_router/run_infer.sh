@@ -36,6 +36,10 @@ for var_name in DATA_PATH MODEL_PATH AGENT_CONFIG; do
     fi
 done
 
+# rl-insight observability: server URL default (only used when the caller sets
+# VERL_RL_INSIGHT_ENABLE=1). Override RL_INSIGHT_SERVER_URL if the server runs elsewhere.
+export RL_INSIGHT_SERVER_URL="${RL_INSIGHT_SERVER_URL:-http://127.0.0.1:18080}"
+
 python "${SCRIPT_DIR}/parallel_infer.py" \
     --data-path "${DATA_PATH}" \
     --model-path "${MODEL_PATH}" \

@@ -44,8 +44,7 @@ class VLLMMetricsDecoder(Decoder):
         "vllm:kv_cache_usage_perc": MetricKey.KV_CACHE_USAGE_PERC,
         "vllm:num_requests_running": MetricKey.NUM_REQUESTS_RUNNING,
         "vllm:num_requests_waiting": MetricKey.NUM_REQUESTS_WAITING,
-        # vLLM 0.21 Prometheus counters carry a ``_total`` suffix (confirmed by
-        # scraping /metrics); the pre-Task-2 names without ``_total`` never matched.
+        # vLLM 0.21 Prometheus counters carry a ``_total`` suffix.
         "vllm:prefix_cache_queries_total": MetricKey.PREFIX_CACHE_QUERIES,
         "vllm:prefix_cache_hits_total": MetricKey.PREFIX_CACHE_HITS,
         # Evidence metrics: TTFT/TPOT histograms + token/external counters.

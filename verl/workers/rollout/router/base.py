@@ -41,19 +41,54 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 class RequestLoadBalancer(Protocol):
     """Protocol for rollout inference load balancers (structural subtyping)."""
 
-    def __init__(self, servers: dict[str, Any], config: Optional[dict] = None) -> None: ...
+    def __init__(self, servers: dict[str, Any], config: Optional[dict] = None) -> None:
+        """Construct the balancer.
 
-    def acquire_server(self, request_id: str, prompt_ids: list[int] | None = None) -> tuple[str, Any]: ...
+        Args:
+            servers: ``{server_id: handle}`` of replicas to route across.
+            config: Optional implementation config (e.g. cache size, determinism).
+        """
 
-    def release_server(self, server_id: str, prompt_len: int = 0) -> None: ...
+    def acquire_server(self, request_id: str, prompt_ids: list[int] | None = None) -> tuple[str, Any]:
+        """Acquire a server for the given request.
 
-    def add_servers(self, servers: dict[str, Any]) -> None: ...
+        Args:
+            request_id: Caller-supplied request id; sticky implementations reuse
+                the server bound to it when available.
+            prompt_ids: Prompt token ids (used by prefix-aware implementations).
 
-    def remove_servers(self, server_ids: list[str]) -> None: ...
+        Returns:
+            A tuple of ``(server_id, handle)`` in a single atomic call.
+        """
 
-    def get_all_servers(self) -> list[str]: ...
+    def release_server(self, server_id: str, prompt_len: int = 0, request_id: str | None = None) -> None:
+        """Release a server after a request completes.
 
-    def get_status(self) -> dict: ...
+        Args:
+            server_id: The server returned by a prior ``acquire_server``.
+            prompt_len: Prompt length (used by some implementations for token accounting).
+            request_id: The request id (used by some implementations for turn accounting).
+        """
+
+    def add_servers(self, servers: dict[str, Any]) -> None:
+        """Atomically add multiple servers to the load balancer pool.
+
+        Args:
+            servers: Dict mapping ``server_id`` → ``handle`` for all servers to register.
+        """
+
+    def remove_servers(self, server_ids: list[str]) -> None:
+        """Atomically remove multiple servers from the load balancer pool.
+
+        Args:
+            server_ids: List of server identifiers to remove.
+        """
+
+    def get_all_servers(self) -> list[str]:
+        """Get list of all active server IDs."""
+
+    def get_status(self) -> dict:
+        """Return current load balancer state for debugging."""
 
 
 # ---------------------------------------------------------------------------

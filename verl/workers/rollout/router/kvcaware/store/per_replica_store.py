@@ -63,7 +63,7 @@ class PerReplicaStore:
             return node[key]
         return METRIC_SPECS[key]["default"]
 
-    def incr(self, node_id: str, key: str, delta: int | float = 1) -> None:
+    def incr(self, node_id: str, key: str, delta: int | float = 1) -> int | float:
         """Apply a numeric delta to one key for one node (inflight ±1).
 
         Unlike ``refresh`` (batch merge overwrite), this is an incremental
@@ -76,14 +76,17 @@ class PerReplicaStore:
             key: Canonical metric key (must be in ``METRIC_SPECS``).
             delta: Signed delta to add (default +1).
 
+        Returns:
+            The new value of ``key`` after applying ``delta``.
+
         Raises:
             KeyError: If ``key`` is not a valid canonical key.
         """
         if key not in METRIC_SPECS:
             raise KeyError(f"Unknown metric key '{key}'. Valid keys: {sorted(METRIC_SPECS.keys())}")
-        self._apply(node_id, {key: delta})
+        return self._apply(node_id, {key: delta})[key]
 
-    def incr_many(self, node_id: str, deltas: dict[str, int | float]) -> None:
+    def incr_many(self, node_id: str, deltas: dict[str, int | float]) -> dict[str, int | float]:
         """Apply multiple signed deltas to one node under a single lock.
 
         Same incremental semantics as :meth:`incr` (reads current, adds delta,
@@ -96,41 +99,61 @@ class PerReplicaStore:
             node_id: Target node.
             deltas: ``{canonical_key: signed_delta}`` (all keys in ``METRIC_SPECS``).
 
+        Returns:
+            ``{canonical_key: new_value}`` for every key in ``deltas``.
+
         Raises:
             KeyError: If any key is not a valid canonical key.
         """
         if not deltas:
-            return
+            return {}
         bad = [k for k in deltas if k not in METRIC_SPECS]
         if bad:
             raise KeyError(f"Unknown metric keys: {sorted(bad)}. Valid keys: {sorted(METRIC_SPECS.keys())}")
-        self._apply(node_id, deltas)
+        return self._apply(node_id, deltas)
 
-    def _apply(self, node_id: str, deltas: dict[str, int | float]) -> None:
+    def _apply(self, node_id: str, deltas: dict[str, int | float]) -> dict[str, int | float]:
         """Apply signed deltas to one node under one lock (caller validates keys).
 
         Each key falls back to its ``METRIC_SPECS`` default before adding the
         delta, so the writer stays stateless — it only emits the +/-delta.
         Shared by :meth:`incr` (single key) and :meth:`incr_many` (batch).
+
+        Returns:
+            ``{canonical_key: new_value}`` after applying each delta — computed
+            from the loop-local ``current + delta`` under the same lock, so there
+            is no second locked read (the emitter consumes these absolutes).
         """
         with self._lock:
             node = self._data.setdefault(node_id, {})
+            new_values: dict[str, int | float] = {}
             for key, delta in deltas.items():
-                node[key] = node.get(key, METRIC_SPECS[key]["default"]) + delta
+                new = node.get(key, METRIC_SPECS[key]["default"]) + delta
+                node[key] = new
+                new_values[key] = new
+            return new_values
 
-    def refresh(self, new_data: dict[str, dict[str, Any]]) -> None:
+    def refresh(self, new_data: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
         """Batch refresh from collectors.
 
         For each node in ``new_data``: merge with existing data
         (new values overwrite same keys).  Nodes NOT in ``new_data``
         are left untouched.
+
+        Returns:
+            ``{node_id: full_merged_snapshot}`` for every node in ``new_data``
+            (all keys, not just the refreshed ones), so callers needing absolute
+            post-refresh values get them without a second locked read.
         """
         with self._lock:
+            snapshots: dict[str, dict[str, Any]] = {}
             for node_id, metrics in new_data.items():
                 existing = self._data.get(node_id, {})
                 merged = dict(existing)
                 merged.update(metrics)
                 self._data[node_id] = merged
+                snapshots[node_id] = dict(merged)
+            return snapshots
 
     def all_ids(self) -> list[str]:
         """Return all node IDs currently in the store."""

@@ -114,7 +114,14 @@ class TestInflightDecoder:
             MetricKey.COMPLETED_COUNT: 1,
         }
         assert upd.is_delta is True
-        assert upd.request_id is None  # on_release carries no request_id
+        assert upd.request_id is None  # no request_id on the event → forwarded as None
+
+    def test_on_release_forwards_request_id_when_event_carries_it(self):
+        upd = InflightDecoder().decode(
+            StatisticEvent("on_release", replica_id="s0", prompt_len=42, request_id="r1"), ""
+        )
+        assert isinstance(upd, MetricsUpdate)
+        assert upd.request_id == "r1"  # carried so the collector can attribute the release
 
     def test_on_release_without_prompt_len_leaves_token_gauge_unchanged(self):
         # Callers that don't track prompt_len release with the default 0, so the
@@ -180,6 +187,19 @@ class TestCallbackTransport:
             StatisticEvent("on_acquire", request_id="r1", replica_id="s0"),
             StatisticEvent("on_release", replica_id="s0", prompt_len=7),
             StatisticEvent("on_servers_removed", server_ids=("s1", "s2")),
+        ]
+
+    def test_on_release_callback_forwards_request_id(self):
+        balancer = _FakeBalancer()
+        transport = CallbackTransport(balancer)
+        received: list = []
+        _run(transport.subscribe(lambda raw, nid: received.append(raw)))
+
+        # (server_id, prompt_len, request_id) — the 3rd arg threads the routing
+        # request id so the collector can attribute the release (e.g. turn subtraction).
+        balancer.callbacks["on_release"][0]("s0", 7, "r1")
+        assert received == [
+            StatisticEvent("on_release", replica_id="s0", prompt_len=7, request_id="r1"),
         ]
 
     def test_stop_unregisters_all(self):
@@ -274,8 +294,8 @@ class TestCollectorCallbackIntegration:
         try:
             # r1 dispatched three times (turns 1,2,3) to s0,s1,s0; r2 once (turn 1)
             # to s1. Each acquire also bumps INFLIGHT/DISPATCHED; the dispatch's
-            # turn is attributed to the receiving replica's TURN_SUM (the inflight
-            # collector carries request_id and does the PerRequestStore/TURN_SUM work).
+            # turn is added to the receiving replica's INFLIGHT_TURN_SUM (the
+            # inflight collector carries request_id and does the PerRequestStore work).
             balancer.callbacks["on_acquire"][0]("r1", "s0")
             balancer.callbacks["on_acquire"][0]("r1", "s1")
             balancer.callbacks["on_acquire"][0]("r1", "s0")
@@ -285,11 +305,12 @@ class TestCollectorCallbackIntegration:
             # per-request turn is global (Nth dispatch of that request_id overall)
             assert ds.get_per_request("r1", "turn", 0) == 3
             assert ds.get_per_request("r2", "turn", 0) == 1
-            # ...but each dispatch's turn is attributed to the receiving replica's
-            # TURN_SUM (per-replica, in PerReplicaStore): s0 got r1's turn-1 + turn-3 = 4;
+            # ...but each dispatch's turn is added to the receiving replica's
+            # INFLIGHT_TURN_SUM (per-replica, in PerReplicaStore; no releases here so
+            # the in-flight sum equals the cumulative): s0 got r1's turn-1 + turn-3 = 4;
             # s1 got r1's turn-2 + r2's turn-1 = 3.
-            assert ds.get_metric("s0", MetricKey.TURN_SUM) == 4
-            assert ds.get_metric("s1", MetricKey.TURN_SUM) == 3
+            assert ds.get_metric("s0", MetricKey.INFLIGHT_TURN_SUM) == 4
+            assert ds.get_metric("s1", MetricKey.INFLIGHT_TURN_SUM) == 3
         finally:
             collector.stop()
 
@@ -297,8 +318,8 @@ class TestCollectorCallbackIntegration:
         """Turn is gated on DISPATCHED_COUNT (a dispatch), not request_id presence.
 
         A hypothetical per-request delta that carries request_id but does NOT
-        bump DISPATCHED_COUNT must not touch the turn table or TURN_SUM — guards
-        against a future request_id-carrying update overloading the turn path.
+        bump DISPATCHED_COUNT must not touch the turn table or INFLIGHT_TURN_SUM —
+        guards against a future request_id-carrying update overloading the turn path.
         """
         from verl.workers.rollout.router.kvcaware.collectors.collector import Collector
         from verl.workers.rollout.router.kvcaware.collectors.decoder import MetricsUpdate
@@ -316,4 +337,135 @@ class TestCollectorCallbackIntegration:
         )
         ds = DataStore()
         assert ds.get_per_request("r1", "turn", 0) == 0  # no dispatch → no turn recorded
-        assert ds.get_metric("s0", MetricKey.TURN_SUM) == 0
+        assert ds.get_metric("s0", MetricKey.INFLIGHT_TURN_SUM) == 0
+
+
+class _RecordingRLInsight:
+    """Records metric_* calls (mirrors the rl_insight high-level API)."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+
+    def init(self, *args, **kwargs) -> None:  # noqa: D401 - test double
+        """No-op stand-in for rl_insight.init."""
+
+    def metric_count(self, name, amount, documentation="", **labels):
+        self.calls.append(("counter", name, amount, dict(labels)))
+
+    def metric_gauge(self, name, value, documentation="", **labels):
+        self.calls.append(("gauge", name, value, dict(labels)))
+
+    def metric_histogram(self, name, value, documentation="", *, buckets=None, **labels):
+        self.calls.append(("histogram", name, value, dict(labels)))
+
+
+class TestCollectorEmitsToInsight:
+    """B-class end-to-end: with rl-insight emit ON, collector writes forward to rl_insight.
+
+    Drives the real ``Collector(CallbackTransport, InflightDecoder)`` through
+    acquire/release and feeds poll/kv updates directly, asserting the recording
+    rl_insight double receives exactly the B-class primitives the emitter maps.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _enable_emit(self, monkeypatch):
+        from verl.workers.rollout.router.kvcaware.insight.emitter import emitter
+        from verl.workers.rollout.router.kvcaware.store.per_replica_store import PerReplicaStore
+        from verl.workers.rollout.router.kvcaware.store.per_request_store import PerRequestStore
+
+        PerReplicaStore._instance = None
+        PerRequestStore._instance = None
+        monkeypatch.setenv(emitter.ENABLE_ENV, "1")
+        self._emitter = emitter
+        self._rl = _RecordingRLInsight()
+        emitter._rl_insight = self._rl
+        emitter._init_done = True
+        yield
+        emitter._reset()
+        PerReplicaStore._instance = None
+        PerRequestStore._instance = None
+
+    def _by_name(self):
+        return {c[1]: c for c in self._rl.calls}
+
+    def test_acquire_forwards_dispatched_promptlen_tokens_avgturn(self):
+        from verl.workers.rollout.router.kvcaware.collectors.collector import Collector
+
+        balancer = _FakeBalancer()
+        collector = Collector(CallbackTransport(balancer), InflightDecoder())
+        collector.start()
+        try:
+            balancer.callbacks["on_acquire"][0]("r1", "s0", [1, 2, 3])  # plen 3, turn 1
+        finally:
+            collector.stop()
+
+        by_name = self._by_name()
+        assert by_name[MetricKey.DISPATCHED_COUNT] == ("counter", MetricKey.DISPATCHED_COUNT, 1, {"replica": "s0"})
+        assert by_name[MetricKey.PROMPT_LEN_SUM] == ("counter", MetricKey.PROMPT_LEN_SUM, 3, {"replica": "s0"})
+        assert by_name[MetricKey.INFLIGHT_TOKENS] == ("gauge", MetricKey.INFLIGHT_TOKENS, 3, {"replica": "s0"})
+        # inflight_avg_turn = in-flight turn sum (1) / in-flight count (1) = 1.0
+        assert by_name["inflight_avg_turn"] == ("gauge", "inflight_avg_turn", 1.0, {"replica": "s0"})
+
+    def test_release_forwards_completed_tokens_and_drives_avgturn_to_zero(self):
+        from verl.workers.rollout.router.kvcaware.collectors.collector import Collector
+
+        balancer = _FakeBalancer()
+        collector = Collector(CallbackTransport(balancer), InflightDecoder())
+        collector.start()
+        try:
+            balancer.callbacks["on_acquire"][0]("r1", "s0", [1, 2, 3])  # plen 3, turn 1
+            balancer.callbacks["on_release"][0]("s0", 3, "r1")  # release r1 (turn subtracted)
+        finally:
+            collector.stop()
+
+        by_name = self._by_name()
+        # release path: completed +1, tokens back to 0, avg turn 0 (idle: count 0)
+        assert by_name[MetricKey.COMPLETED_COUNT] == ("counter", MetricKey.COMPLETED_COUNT, 1, {"replica": "s0"})
+        assert by_name[MetricKey.INFLIGHT_TOKENS] == ("gauge", MetricKey.INFLIGHT_TOKENS, 0, {"replica": "s0"})
+        assert by_name["inflight_avg_turn"] == ("gauge", "inflight_avg_turn", 0.0, {"replica": "s0"})
+
+    def test_poll_forwards_levels_cumulatives_and_load(self):
+        from verl.workers.rollout.router.kvcaware.collectors.collector import Collector
+        from verl.workers.rollout.router.kvcaware.collectors.decoder import MetricsUpdate
+
+        collector = Collector(CallbackTransport(_FakeBalancer()), InflightDecoder())
+        collector._write_metrics_update(
+            MetricsUpdate(
+                node_id="s0",
+                metrics={
+                    MetricKey.KV_CACHE_USAGE_PERC: 0.5,
+                    MetricKey.NUM_REQUESTS_RUNNING: 2,
+                    MetricKey.NUM_REQUESTS_WAITING: 1,
+                    MetricKey.PROMPT_TOKENS: 1000,
+                    MetricKey.PROMPT_TOKENS_CACHED: 200,
+                    MetricKey.EXTERNAL_PREFIX_CACHE_HITS: 50,
+                    MetricKey.ESTIMATED_FLOPS_PER_GPU: 999,
+                },
+                is_delta=False,
+            )
+        )
+
+        emitted = {c[1] for c in self._rl.calls}
+        assert emitted == {
+            MetricKey.KV_CACHE_USAGE_PERC,
+            MetricKey.NUM_REQUESTS_RUNNING,
+            MetricKey.NUM_REQUESTS_WAITING,
+            MetricKey.PROMPT_TOKENS,
+            MetricKey.PROMPT_TOKENS_CACHED,
+            MetricKey.EXTERNAL_PREFIX_CACHE_HITS,
+            MetricKey.ESTIMATED_FLOPS_PER_GPU,
+            "kv_cache_load",
+        }
+        assert all(c[0] == "gauge" for c in self._rl.calls)  # all 8 are gauges
+        # kv_cache_load is 0.0 here (no retained blocks in the fresh store)
+        assert self._by_name()["kv_cache_load"] == ("gauge", "kv_cache_load", 0.0, {"replica": "s0"})
+
+    def test_kv_removed_forwards_evictions(self):
+        from verl.workers.rollout.router.kvcaware.collectors.collector import Collector
+        from verl.workers.rollout.router.kvcaware.collectors.decoder import KVCacheUpdate
+        from verl.workers.rollout.router.kvcaware.types import Layer
+
+        collector = Collector(CallbackTransport(_FakeBalancer()), InflightDecoder())
+        collector._write_kv_update(KVCacheUpdate(node_id="s0", remove_blocks={Layer.GPU: ["h1", "h2", "h3"]}))
+
+        assert self._rl.calls == [("counter", "kv_evictions", 3, {"replica": "s0"})]

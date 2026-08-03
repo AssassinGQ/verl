@@ -208,15 +208,17 @@ class KVCAwareBalancer:
             "sticky_size": self._store.sticky_status()["size"],
         }
 
-    def release_server(self, server_id: str, prompt_len: int = 0) -> None:
+    def release_server(self, server_id: str, prompt_len: int = 0, request_id: str | None = None) -> None:
         """Release a server after a request completes; fires ``on_release``.
 
         ``prompt_len`` (``len(prompt_ids)`` of the completing request) mirrors the
         value passed at ``acquire_server`` time, so the in-flight token gauge is
-        decremented by exactly what acquire added. Defaults to 0 for callers that
-        do not track it (the token gauge simply stays unchanged on release).
+        decremented by exactly what acquire added. ``request_id`` lets the inflight
+        decoder attribute the release to the right request (e.g. to subtract its
+        turn from the in-flight turn sum). Both default for callers that do not
+        track them (the token gauge simply stays unchanged on release).
         """
-        self._fire("on_release", server_id, prompt_len)
+        self._fire("on_release", server_id, prompt_len, request_id)
 
     def acquire_server(self, request_id: str, prompt_ids: list[int] | None = None) -> tuple[str, Any]:
         """Delegate to ``route()`` for a best-first ranking, return ``(top, handle)``.

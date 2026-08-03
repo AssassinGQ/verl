@@ -30,22 +30,12 @@ DEFAULT_ROUTING_CACHE_SIZE = 10000
 @LoadBalancerRegistry.register("global_sticky_inflight")
 @ray.remote
 class GlobalRequestLoadBalancer:
-    """Global sticky-session + in-flight load balancer shared by all AgentLoopWorkers.
+    """Global sticky-session + least-inflight load balancer.
 
-    When a sticky session points to a removed server, the cache entry is
-    automatically invalidated and a new server is selected.
-
-    Key features:
-    - **Atomic acquire**: ``acquire_server()`` returns ``(server_id, handle)``
-    - **Sticky Session**: Uses LRUCache to map request_id → server_id, ensuring
-      multi-turn conversations route to the same server.
-    - **Least-loaded Selection**: When no sticky session exists, selects the
-      server with the fewest in-flight requests.
-    - **Deterministic Routing**: When ``full_determinism=True``, tie-breaking
-      among equally-loaded servers uses ``hash(request_id)`` so the same
-      request always routes to the same server across runs.
-    - **Dynamic Server Management**: Supports add/remove servers at runtime
-      for hybrid scaling.
+    ``request_id`` → server via LRU so multi-turn routes to the same server;
+    no sticky hit → least-inflight server. A sticky entry pointing at a removed
+    server is invalidated and re-selected. ``full_determinism=True`` makes
+    tie-breaking ``hash(request_id)``-based for reproducible runs.
     """
 
     def __init__(
@@ -53,8 +43,10 @@ class GlobalRequestLoadBalancer:
         servers: dict[str, ray.actor.ActorHandle],
         config: Optional[dict] = None,
     ):
-        # Allow empty initial servers: in dynamic-resource-scheduling mode all
-        # replicas are hybrid and will be registered later via add_servers().
+        """Construct; ``servers`` may be empty (added later via ``add_servers``).
+
+        Reads ``max_cache_size`` and ``full_determinism`` from ``config``.
+        """
 
         config = config or {}
         max_cache_size = config.get("max_cache_size", DEFAULT_ROUTING_CACHE_SIZE)
@@ -66,11 +58,8 @@ class GlobalRequestLoadBalancer:
         self._full_determinism = full_determinism
 
     def acquire_server(self, request_id: str, prompt_ids: list[int] | None = None) -> tuple[str, ray.actor.ActorHandle]:
-        """Acquire a server for the given request (sticky + least-loaded).
-
-        Returns:
-            A tuple of ``(server_id, actor_handle)`` in a single atomic call.
-        """
+        """Sticky-first (``request_id``→server via LRU), else least-inflight;
+        ``full_determinism`` → ``hash(request_id)`` tie-break."""
         # Try sticky session first
         if request_id in self._request_id_to_server:
             server_id = self._request_id_to_server[request_id]
@@ -98,41 +87,22 @@ class GlobalRequestLoadBalancer:
         self._inflight_requests[server_id] += 1
         return server_id, self._servers[server_id]
 
-    def release_server(self, server_id: str, prompt_len: int = 0) -> None:
-        """Release a server after a request completes.
-
-        ``prompt_len`` is accepted for signature parity with the kvc-aware
-        balancer (which uses it for its in-flight token gauge); this balancer
-        tracks request counts only and ignores it.
-        """
+    def release_server(self, server_id: str, prompt_len: int = 0, request_id: str | None = None) -> None:
+        """Release after a request completes (decrement in-flight; ignores ``prompt_len``/``request_id``)."""
         if server_id not in self._inflight_requests:
             return
         if self._inflight_requests[server_id] > 0:
             self._inflight_requests[server_id] -= 1
 
     def add_servers(self, servers: dict[str, ray.actor.ActorHandle]) -> None:
-        """Atomically add multiple servers to the load balancer pool.
-
-        This is more efficient than calling :meth:`add_server` in a loop
-        because it performs a single bulk update on the internal state.
-
-        Args:
-            servers: Dict mapping server_id → actor_handle for all servers
-                to register.
-        """
+        """Register ``servers`` into the pool (in-flight counts start at 0)."""
         for sid, handle in servers.items():
             self._inflight_requests[sid] = 0
             self._servers[sid] = handle
         logger.info(f"[GlobalLoadBalancer] added {len(servers)} servers")
 
     def remove_servers(self, server_ids: list[str]) -> None:
-        """Atomically remove multiple servers from the load balancer pool.
-
-        More efficient than calling :meth:`remove_server` in a loop.
-
-        Args:
-            server_ids: List of server identifiers to remove.
-        """
+        """Drop ``server_ids`` from the pool (clears in-flight + handle)."""
         for sid in server_ids:
             self._inflight_requests.pop(sid, None)
             self._servers.pop(sid, None)
@@ -147,18 +117,8 @@ class GlobalRequestLoadBalancer:
         return list(self._inflight_requests.keys())
 
     def clear_sticky_cache(self) -> dict:
-        """Clear the sticky-session cache to force request redistribution.
-
-        After clearing, all subsequent ``acquire_server()`` calls will select
-        the least-loaded server (based on ``_inflight_requests``), which
-        naturally balances load across all active replicas — including newly
-        added ones with zero in-flight requests.
-
-        Returns:
-            A dict with ``cleared_entries`` (number of cache entries dropped)
-            and ``server_loads`` (current per-server inflight counts for
-            diagnostics).
-        """
+        """Clear sticky-session cache so subsequent ``acquire_server()`` calls
+        re-select least-inflight. Returns ``{cleared_entries, server_loads}``."""
         cleared = len(self._request_id_to_server)
         self._request_id_to_server.clear()
         logger.info(

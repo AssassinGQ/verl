@@ -70,6 +70,12 @@ class MetricKey:
     # differently — this gauge captures that. acquire/release share the same
     # request's prompt_len in one generate() scope, so the gauge is symmetric.
     INFLIGHT_TOKENS: str = "inflight_tokens"
+    # In-flight turn sum (acquire += turn / release -= turn), per replica. The
+    # numerator of inflight_avg_turn = in-flight turn sum / in-flight count — the
+    # instantaneous "how many turns deep are the in-flight requests" level. acquire
+    # adds the request's current turn; release subtracts the same turn (release
+    # does not change turn), so it stays balanced and returns to 0 when idle.
+    INFLIGHT_TURN_SUM: str = "inflight_turn_sum"
     # Cumulative dispatched request count (acquire +1) — the running inflight
     # gauge's monotonic sibling. Per-replica; sum across replicas for the global
     # dispatched volume. Paired with COMPLETED_COUNT for dispatch/complete rates.
@@ -77,10 +83,6 @@ class MetricKey:
     # Cumulative completed request count (release +1). Per-replica; paired with
     # DISPATCHED_COUNT — completed/dispatched ratio is the realized-throughput share.
     COMPLETED_COUNT: str = "completed_count"
-    # Cumulative sum of per-request turn at dispatch, per replica. Each dispatch's
-    # turn (Nth time that request_id was dispatched globally) is added to the
-    # receiving replica's TURN_SUM. Windowed avg turn = Δturn_sum / Δdispatched.
-    TURN_SUM: str = "turn_sum"
     # Cumulative sum of dispatched prompt lengths (len(prompt_ids)), per replica.
     # Each dispatch adds the request's input prompt length to the receiving
     # replica's PROMPT_LEN_SUM. Windowed avg prompt len = Δsum / Δdispatched — the
@@ -189,6 +191,11 @@ METRIC_SPECS: dict[str, dict[str, Any]] = {
         "value_type": int,
         "describe": "In-flight prompt tokens (acquire +prompt_len / release -prompt_len) — token-weighted load",
     },
+    MetricKey.INFLIGHT_TURN_SUM: {
+        "default": 0,
+        "value_type": int,
+        "describe": "In-flight turn sum per replica (acquire +=turn / release -=turn); inflight_avg_turn numerator",
+    },
     MetricKey.DISPATCHED_COUNT: {
         "default": 0,
         "value_type": int,
@@ -198,11 +205,6 @@ METRIC_SPECS: dict[str, dict[str, Any]] = {
         "default": 0,
         "value_type": int,
         "describe": "Cumul. completed requests per replica (release +1) — realized-throughput share",
-    },
-    MetricKey.TURN_SUM: {
-        "default": 0,
-        "value_type": int,
-        "describe": "Cumul. sum of per-request turn at dispatch, per replica (avg turn = Δturn_sum/Δdispatched)",
     },
     MetricKey.PROMPT_LEN_SUM: {
         "default": 0,

@@ -40,13 +40,13 @@ class StatisticEvent:
     in arity, so they cannot be forced into ``(raw, node_id)``:
 
     - ``on_acquire(request_id, chosen, prompt_ids)``  → two strings + a token list
-    - ``on_release(server_id, prompt_len)``           → string + int, missing node_id
+    - ``on_release(server_id, prompt_len, request_id)`` → string + int + optional id
     - ``on_servers_removed(ids)``                     → list[str], not bytes/str
 
     Attributes:
         event: Hook name — ``"on_acquire"`` / ``"on_release"`` /
             ``"on_servers_removed"``.
-        request_id: The routing request id (set on ``on_acquire``).
+        request_id: The routing request id (set on ``on_acquire`` and ``on_release``).
         replica_id: The chosen replica (``on_acquire``) or the released server
             (``on_release``) — unified under one field so one decoder can treat
             both as "the replica this event is about".
@@ -103,8 +103,16 @@ class CallbackTransport(Transport):
                 "",
             )
 
-        def _on_release(server_id: str, prompt_len: int = 0) -> None:
-            handler(StatisticEvent("on_release", replica_id=server_id, prompt_len=prompt_len), "")
+        def _on_release(server_id: str, prompt_len: int = 0, request_id: str | None = None) -> None:
+            handler(
+                StatisticEvent(
+                    "on_release",
+                    replica_id=server_id,
+                    prompt_len=prompt_len,
+                    request_id=request_id,
+                ),
+                "",
+            )
 
         def _on_servers_removed(server_ids: list[str]) -> None:
             handler(StatisticEvent("on_servers_removed", server_ids=tuple(server_ids)), "")

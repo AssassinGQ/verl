@@ -19,10 +19,11 @@
 InflightDecoder)`` that registers ``on_acquire`` / ``on_release`` on the
 Balancer. acquire bumps the chosen replica's INFLIGHT_COUNT (+1, mirroring verl
 ``GlobalRequestLoadBalancer._inflight_requests``) and DISPATCHED_COUNT, and
-records the per-request turn (``PerRequestStore``) attributed to the receiving
-replica's TURN_SUM; release decrements INFLIGHT and bumps COMPLETED_COUNT.
-``TestInflightEndToEnd`` covers the gauge + dispatched/completed counters;
-``TestTurnTracking`` covers per-request turn + per-replica turn_sum attribution.
+records the per-request turn (``PerRequestStore``) added to the receiving
+replica's INFLIGHT_TURN_SUM (and subtracted on release); release also decrements
+INFLIGHT and bumps COMPLETED_COUNT. ``TestInflightEndToEnd`` covers the gauge +
+dispatched/completed counters; ``TestTurnTracking`` covers per-request turn +
+per-replica inflight_turn_sum attribution.
 """
 
 from __future__ import annotations
@@ -104,13 +105,13 @@ def _total(balancer, key: str) -> int:
 
 
 class TestTurnTracking:
-    """Per-request turn + per-replica turn_sum, via the real inflight_stat collector."""
+    """Per-request turn + per-replica inflight_turn_sum, via the real inflight_stat collector."""
 
     def test_cold_request_starts_at_turn_one(self):
         balancer = _make_balancer({"s0": "h0", "s1": "h1"})
         sid, _ = balancer.acquire_server("r1", [1])
         assert balancer._store.get_per_request("r1", "turn", 0) == 1
-        assert balancer._store.get_metric(sid, MetricKey.TURN_SUM) == 1
+        assert balancer._store.get_metric(sid, MetricKey.INFLIGHT_TURN_SUM) == 1
         assert balancer._store.get_metric(sid, MetricKey.DISPATCHED_COUNT) == 1
 
     def test_re_dispatch_of_same_request_climbs_turn(self):
@@ -120,8 +121,8 @@ class TestTurnTracking:
         for _ in range(3):
             balancer.acquire_server("r1", [1])  # turns 1, 2, 3
         assert balancer._store.get_per_request("r1", "turn", 0) == 3
-        # turn_sum across replicas = 1+2+3 = 6 (each turn attributed to its receiver).
-        assert _total(balancer, MetricKey.TURN_SUM) == 6
+        # inflight_turn_sum across replicas = 1+2+3 = 6 (each turn added to its receiver).
+        assert _total(balancer, MetricKey.INFLIGHT_TURN_SUM) == 6
         assert _total(balancer, MetricKey.DISPATCHED_COUNT) == 3
 
     def test_distinct_requests_each_track_their_own_turn(self):
@@ -145,7 +146,7 @@ class TestTurnTracking:
         for _ in range(3):
             balancer.acquire_server("r1", [1])
         balancer.acquire_server("r2", [1])
-        # Per-request turn is global; the turn VALUES are attributed per-replica,
-        # so the cross-replica turn_sum = 1+2+3+1 = 7 and dispatched = 4.
-        assert _total(balancer, MetricKey.TURN_SUM) == 7
+        # Per-request turn is global; the turn VALUES are added per-replica,
+        # so the cross-replica inflight_turn_sum = 1+2+3+1 = 7 and dispatched = 4.
+        assert _total(balancer, MetricKey.INFLIGHT_TURN_SUM) == 7
         assert _total(balancer, MetricKey.DISPATCHED_COUNT) == 4
