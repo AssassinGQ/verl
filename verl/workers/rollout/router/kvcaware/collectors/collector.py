@@ -23,9 +23,10 @@ from collections import defaultdict
 from concurrent.futures import Future
 
 from ..config.collector import CollectorConfig
+from ..insight import WriteEvent, WriteKind, emitter
 from ..logging import get_router_logger
 from ..store.data_store import DataStore
-from ..types import MetricKey
+from ..types import EmitKey, MetricKey
 from .decoder import Decoder, KVCacheUpdate, MetricsUpdate, StickyUpdate
 from .transport.base import Transport
 
@@ -36,7 +37,7 @@ logger = get_router_logger("collector")
 # collector feeds the router against vllm's own engine-stats log.
 _METRICS_LOG_EVERY_POLLS = 30
 
-# Emit the per-replica dispatched/completed/turn_sum snapshot (the
+# Emit the per-replica dispatched/completed/inflight_turn_sum snapshot (the
 # `router-dispatch` log line) at most this often (seconds). Time-throttled so
 # the cadence is load-independent; checked on each acquire/release, so idle
 # stretches emit nothing.
@@ -102,7 +103,7 @@ class Collector:
         self._kv_event_counts: dict[str, int] = defaultdict(int)
         self._kv_block_counts: dict[str, int] = defaultdict(int)
         self._kv_last_logged_total = 0
-        # Last-emit time for the dispatched/completed/turn_sum snapshot (throttled).
+        # Last-emit time for the dispatched/completed/inflight_turn_sum snapshot (throttled).
         self._dispatch_last_log: float = 0.0
 
     # ── Lifecycle ───────────────────────────────────────────────────────
@@ -172,6 +173,14 @@ class Collector:
         if n_removed:
             self._kv_event_counts["removed"] += 1
             self._kv_block_counts["removed"] += n_removed
+            if emitter.enabled():
+                emitter.on_write(
+                    WriteEvent(
+                        kind=WriteKind.KV_REMOVED,
+                        node=update.node_id,
+                        deltas={EmitKey.KV_EVICTIONS: n_removed},
+                    )
+                )
         total = sum(self._kv_event_counts.values())
         if total - self._kv_last_logged_total >= _KV_EVENT_LOG_EVERY:
             self._kv_last_logged_total = total
@@ -182,32 +191,64 @@ class Collector:
             )
 
     def _write_metrics_update(self, update: MetricsUpdate) -> None:
-        """Write MetricsUpdate via DataStore, then emit a periodic evidence log.
+        """Write MetricsUpdate via DataStore, then forward to the insight emitter.
 
-        Delta updates route to ``incr_metric``; a dispatch (DISPATCHED_COUNT
-        bumped) also records its turn to ``TURN_SUM``. Both acquire and release
-        refresh the throttled ``router-dispatch`` snapshot. Absolute (non-delta)
-        updates are polled gauges → evidence-log path below.
+        Delta updates (acquire/release) route to ``incr_metrics``; the in-flight
+        turn sum (``INFLIGHT_TURN_SUM``) is folded into the same locked write —
+        acquire adds the request's current turn, release subtracts it (release
+        does not change turn, so it subtracts the same value acquire added).
+        Both acquire and release refresh the throttled ``router-dispatch``
+        snapshot. Absolute (non-delta) updates are polled gauges → evidence-log
+        path below. When rl-insight emit is on, each write also builds a
+        :class:`WriteEvent` from the store's returned post-write values and hands
+        it to the emitter (the 14 B-class signals).
         """
         if update.is_delta:
             # Batch the decoder's signed deltas in ONE locked PerReplica write.
-            # An on_acquire update carries INFLIGHT/DISPATCHED/PROMPT_LEN_SUM;
-            # a dispatch (DISPATCHED_COUNT bumped) also folds in TURN_SUM. Turn
-            # fires only on a dispatch, not on request_id presence — a
-            # request_id-carrying non-dispatch update must not be mis-counted.
-            # The turn lookup runs first (it lives in PerRequestStore, a
-            # separate lock) so its result can join this batch instead of
-            # needing a second PerReplica lock cycle.
+            # Turn lives in PerRequestStore (a separate lock), so look it up first
+            # and let it join this batch instead of needing a second PerReplica
+            # lock cycle. Turn fires only on a dispatch/release, not on request_id
+            # presence — a request_id-carrying non-dispatch update is left alone.
             deltas = dict(update.metrics)
-            if MetricKey.DISPATCHED_COUNT in deltas:
+            is_acquire = MetricKey.DISPATCHED_COUNT in deltas
+            is_release = MetricKey.COMPLETED_COUNT in deltas
+            if is_acquire:
                 if update.request_id is None:
                     logger.debug("dispatch (DISPATCHED_COUNT) update missing request_id — skipping turn")
                 else:
-                    deltas[MetricKey.TURN_SUM] = self._data_store.incr_per_request(update.request_id, "turn")
-            self._data_store.incr_metrics(update.node_id, deltas)
+                    deltas[MetricKey.INFLIGHT_TURN_SUM] = self._data_store.incr_per_request(update.request_id, "turn")
+            elif is_release:
+                if update.request_id is None:
+                    logger.debug("release (COMPLETED_COUNT) update missing request_id — skipping turn subtraction")
+                else:
+                    deltas[MetricKey.INFLIGHT_TURN_SUM] = -self._data_store.get_per_request(
+                        update.request_id, "turn", 0
+                    )
+            new_values = self._data_store.incr_metrics(update.node_id, deltas)
+            if emitter.enabled() and (is_acquire or is_release):
+                emitter.on_write(
+                    WriteEvent(
+                        kind=WriteKind.ACQUIRE if is_acquire else WriteKind.RELEASE,
+                        node=update.node_id,
+                        deltas=deltas,
+                        new_values=new_values,
+                        request_id=update.request_id,
+                        turn_sum=new_values.get(MetricKey.INFLIGHT_TURN_SUM),
+                        inflight_count=new_values.get(MetricKey.INFLIGHT_COUNT),
+                    )
+                )
             self._maybe_log_dispatch_stats()
             return
-        self._data_store.refresh_metrics({update.node_id: update.metrics})
+        snapshots = self._data_store.refresh_metrics({update.node_id: update.metrics})
+        if emitter.enabled():
+            emitter.on_write(
+                WriteEvent(
+                    kind=WriteKind.POLL,
+                    node=update.node_id,
+                    new_values=snapshots.get(update.node_id, {}),
+                    load=self._data_store.kv_cache_load(update.node_id),
+                )
+            )
 
         # Periodic visibility into what the collector fed the router — compare
         # against vllm's own "GPU KV cache usage" engine-stats log line.
@@ -235,7 +276,7 @@ class Collector:
             logger.warning(f"unknown StickyUpdate action: {update.action}")
 
     def _maybe_log_dispatch_stats(self) -> None:
-        """Emit per-replica dispatched/completed/turn_sum/prompt_len_sum counters at most every interval.
+        """Emit per-replica dispatched/completed/inflight_turn_sum/prompt_len_sum counters at most every interval.
 
         Reads each dispatched replica's cumulative counters from PerReplicaStore and
         logs them (the ``router-dispatch`` line); the plot derives trailing-5-min
@@ -252,11 +293,11 @@ class Collector:
             if not dispatched:  # skip replicas that never received a dispatch
                 continue
             completed = snap.get(MetricKey.COMPLETED_COUNT, 0)
-            turn_sum = snap.get(MetricKey.TURN_SUM, 0)
+            inflight_turn_sum = snap.get(MetricKey.INFLIGHT_TURN_SUM, 0)
             prompt_len_sum = snap.get(MetricKey.PROMPT_LEN_SUM, 0)
             logger.info(
                 f"router-dispatch replica={rep} dispatched={dispatched} completed={completed} "
-                f"turn_sum={turn_sum} prompt_len_sum={prompt_len_sum}"
+                f"inflight_turn_sum={inflight_turn_sum} prompt_len_sum={prompt_len_sum}"
             )
 
     def _log_evidence_window(self, node_id: str) -> None:

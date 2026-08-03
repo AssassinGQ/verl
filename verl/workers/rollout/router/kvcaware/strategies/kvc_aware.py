@@ -16,9 +16,11 @@
 
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING
 
 from ..config.strategy import KVCAwareStrategyConfig
+from ..insight import emitter
 from ..logging import get_router_logger
 from ..types import Layer, MetricKey, OverloadMode, SlowCut
 from .registry import StrategyRegistry
@@ -243,19 +245,27 @@ class KVCacheAwareStrategy:
             raise StrategyError(f"replicas must be a list, got {type(replicas).__name__}")
         if not replicas:
             return []
-        # Sticky short-circuit.
-        shortcut: list[float] | None = None
-        if self.do_shortcut:
-            shortcut = self._sticky_shortcut(store, replicas, request_id)
-            if shortcut is not None:
-                return shortcut
-        if self.slow_cut == SlowCut.LEAST_INFLIGHT:
-            return [-store.get_metric(r.replica_id, MetricKey.INFLIGHT_COUNT) for r in replicas]
-        if self.slow_cut == SlowCut.PREFIX_LOAD_AWARE:
-            return self._prefix_load_aware(store, replicas, prompt_ids or [])
-        if self.slow_cut == SlowCut.CAPACITY_TOKEN_AWARE:
-            return self._capacity_token_scores(store, replicas, prompt_ids or [])
-        raise ValueError(f"Unknow slowcut type {self.slow_cut}")
+        # Self-time the scoring body and observe one route_latency sample per
+        # score() call. Every return path (sticky short-circuit / least-inflight
+        # / each slow_cut) lands in the finally, so route_latency covers all of
+        # them — including the very fast sticky return. No-op when rl-insight off.
+        t0 = time.perf_counter()
+        try:
+            # Sticky short-circuit.
+            shortcut: list[float] | None = None
+            if self.do_shortcut:
+                shortcut = self._sticky_shortcut(store, replicas, request_id)
+                if shortcut is not None:
+                    return shortcut
+            if self.slow_cut == SlowCut.LEAST_INFLIGHT:
+                return [-store.get_metric(r.replica_id, MetricKey.INFLIGHT_COUNT) for r in replicas]
+            if self.slow_cut == SlowCut.PREFIX_LOAD_AWARE:
+                return self._prefix_load_aware(store, replicas, prompt_ids or [])
+            if self.slow_cut == SlowCut.CAPACITY_TOKEN_AWARE:
+                return self._capacity_token_scores(store, replicas, prompt_ids or [])
+            raise ValueError(f"Unknow slowcut type {self.slow_cut}")
+        finally:
+            emitter.on_route(time.perf_counter() - t0)
 
     def _prefix_load_aware(
         self,
@@ -285,6 +295,7 @@ class KVCacheAwareStrategy:
             loads[replica.replica_id] = load
             s_load = 1.0 - load
             s_cache, gpu_hit = self._cache_score(store, replica, effective_prompt_ids)
+            emitter.on_score(replica.replica_id, {"load": load, "s_cache": s_cache})
             score = self.alpha * s_cache + (1 - self.alpha) * s_load
             result.append(score)
             logger.info(
@@ -370,6 +381,7 @@ class KVCacheAwareStrategy:
             avail = cap * (1.0 - kv_perc)
             need = plen * (1.0 - gpu_hit)
             remaining = avail - need
+            emitter.on_score(replica.replica_id, {"avail": avail, "need": need, "remaining": remaining})
             rows.append(
                 {
                     "replica": replica,

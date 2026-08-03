@@ -27,9 +27,11 @@ siblings of the gauge that carry dispatch / completion volume per replica.
 Summed across replicas they give the global dispatched/completed totals; their
 ratio is the realized-throughput share. On acquire the decoder also forwards
 ``request_id``: the collector uses it to bump the per-request turn counter
-(``PerRequestStore``) and attribute that turn to the receiving replica's
-``TURN_SUM`` — so the per-replica view and the turn-weighted view share the
-inflight collector's home (one callback subscription, one decode pass). On
+(``PerRequestStore``) and add that turn to the receiving replica's in-flight
+turn sum (``INFLIGHT_TURN_SUM``); release forwards ``request_id`` too so the
+same turn is subtracted, keeping the sum balanced — the per-replica view and
+the turn-weighted view share the inflight collector's home (one callback
+subscription, one decode pass). On
 acquire the request's input prompt length (``event.prompt_len``) is also
 forwarded as a ``PROMPT_LEN_SUM`` delta — the per-replica cumulative
 request-size signal the plot derives an average dispatched prompt length from.
@@ -44,7 +46,7 @@ Event → delta mapping:
 - ``on_acquire`` → ``INFLIGHT_COUNT``/``DISPATCHED_COUNT`` +1,
   ``INFLIGHT_TOKENS``/``PROMPT_LEN_SUM`` +``prompt_len``, carrying ``request_id``.
 - ``on_release`` → ``INFLIGHT_COUNT`` -1, ``INFLIGHT_TOKENS`` -``prompt_len``,
-  ``COMPLETED_COUNT`` +1.
+  ``COMPLETED_COUNT`` +1, carrying ``request_id``.
 
 ``on_servers_removed`` is intentionally a no-op (returns ``None``): verl never
 removes servers and maintains ``_inflight_requests`` purely via symmetric
@@ -97,5 +99,6 @@ class InflightDecoder(Decoder):
                     MetricKey.COMPLETED_COUNT: 1,
                 },
                 is_delta=True,
+                request_id=event.request_id,
             )
         return None

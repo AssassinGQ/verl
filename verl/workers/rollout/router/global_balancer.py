@@ -98,12 +98,13 @@ class GlobalRequestLoadBalancer:
         self._inflight_requests[server_id] += 1
         return server_id, self._servers[server_id]
 
-    def release_server(self, server_id: str, prompt_len: int = 0) -> None:
+    def release_server(self, server_id: str, prompt_len: int = 0, request_id: str | None = None) -> None:
         """Release a server after a request completes.
 
-        ``prompt_len`` is accepted for signature parity with the kvc-aware
-        balancer (which uses it for its in-flight token gauge); this balancer
-        tracks request counts only and ignores it.
+        ``prompt_len`` and ``request_id`` are accepted for signature parity with
+        the kvc-aware balancer (which uses them for its in-flight token gauge and
+        turn attribution); this balancer tracks request counts only and ignores
+        both.
         """
         if server_id not in self._inflight_requests:
             return

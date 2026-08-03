@@ -11,13 +11,3 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-"""Shared types, imported by many internal modules."""
-
-from .emit_spec import EMIT_SPECS, EmitKey
-from .layer import Layer
-from .metric_spec import METRIC_SPECS, MetricKey
-from .overload_mode import OverloadMode
-from .slow_cut import SlowCut
-
-__all__ = ["EmitKey", "EMIT_SPECS", "Layer", "MetricKey", "METRIC_SPECS", "OverloadMode", "SlowCut"]

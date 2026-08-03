@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared types, imported by many internal modules."""
+"""Outbound observability: pushes router signals to rl-insight.
 
-from .emit_spec import EMIT_SPECS, EmitKey
-from .layer import Layer
-from .metric_spec import METRIC_SPECS, MetricKey
-from .overload_mode import OverloadMode
-from .slow_cut import SlowCut
+Physically isolated from the inbound ``collectors/`` (scrape vLLM) — opposite
+data-flow direction, never mixed.
+"""
 
-__all__ = ["EmitKey", "EMIT_SPECS", "Layer", "MetricKey", "METRIC_SPECS", "OverloadMode", "SlowCut"]
+from .emitter import Emitter, WriteEvent, WriteKind, emitter
+
+__all__ = ["Emitter", "WriteEvent", "WriteKind", "emitter"]

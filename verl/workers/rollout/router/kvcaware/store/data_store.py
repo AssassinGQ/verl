@@ -79,7 +79,7 @@ class DataStore:
         """Return all node IDs that have metrics in the store."""
         return self._metrics.all_ids()
 
-    def refresh_metrics(self, new_data: dict[str, dict[str, Any]]) -> None:
+    def refresh_metrics(self, new_data: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
         """Batch refresh metrics from collectors.
 
         For each node in ``new_data``: merge with existing data
@@ -88,8 +88,11 @@ class DataStore:
 
         Args:
             new_data: Dict of {node_id: {canonical_key: value}}.
+
+        Returns:
+            ``{node_id: full_merged_snapshot}`` (see ``PerReplicaStore.refresh``).
         """
-        self._metrics.refresh(new_data)
+        return self._metrics.refresh(new_data)
 
     # ── KVCacheStore operations ─────────────────────────────────────────
 
@@ -198,23 +201,29 @@ class DataStore:
 
     # ── PerReplicaStore incremental write ──────────────────────────────────
 
-    def incr_metric(self, node_id: str, key: str, delta: int | float = 1) -> None:
+    def incr_metric(self, node_id: str, key: str, delta: int | float = 1) -> int | float:
         """Apply a signed delta to one metric for one node (inflight ±1).
 
         Routes to ``PerReplicaStore.incr`` (not ``refresh``) so a stateless delta
         emitter (``InflightDecoder``) can move a running counter without
         tracking the absolute value itself.
-        """
-        self._metrics.incr(node_id, key, delta)
 
-    def incr_metrics(self, node_id: str, deltas: dict[str, int | float]) -> None:
+        Returns:
+            The new value of ``key``.
+        """
+        return self._metrics.incr(node_id, key, delta)
+
+    def incr_metrics(self, node_id: str, deltas: dict[str, int | float]) -> dict[str, int | float]:
         """Apply multiple signed deltas to one node under a single lock.
 
         Batched variant of :meth:`incr_metric` for the ``on_acquire`` decoder,
         which emits several deltas per dispatch (INFLIGHT / DISPATCHED /
         PROMPT_LEN_SUM) — batching avoids one lock cycle per key on the hot path.
+
+        Returns:
+            ``{canonical_key: new_value}`` for every key in ``deltas``.
         """
-        self._metrics.incr_many(node_id, deltas)
+        return self._metrics.incr_many(node_id, deltas)
 
     # ── Sticky bindings (a per-request value stored under _STICKY_KEY) ───
 

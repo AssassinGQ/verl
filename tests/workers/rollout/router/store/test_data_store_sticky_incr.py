@@ -164,3 +164,61 @@ class TestDataStoreStickyDelegation:
         ds.put_sticky_binding("r1", "s0")
         ds.invalidate_sticky_replica("sX")  # no binding points at sX
         assert ds.get_sticky_binding("r1") == "s0"
+
+
+# ── Write methods return post-write values (§23 modified-X foundation) ──
+
+
+class TestPerReplicaStoreWriteReturns:
+    """incr / incr_many / refresh return the values they just wrote."""
+
+    def test_incr_returns_new_value(self):
+        s = PerReplicaStore()
+        assert s.incr("n0", MetricKey.INFLIGHT_COUNT) == 1
+        assert s.incr("n0", MetricKey.INFLIGHT_COUNT, 2) == 3
+
+    def test_incr_negative_delta_returned(self):
+        s = PerReplicaStore()
+        s.incr("n0", MetricKey.INFLIGHT_COUNT, 5)
+        assert s.incr("n0", MetricKey.INFLIGHT_COUNT, -2) == 3
+
+    def test_incr_many_returns_all_new_values(self):
+        s = PerReplicaStore()
+        out = s.incr_many("n0", {MetricKey.INFLIGHT_COUNT: 1, MetricKey.DISPATCHED_COUNT: 1})
+        assert out == {MetricKey.INFLIGHT_COUNT: 1, MetricKey.DISPATCHED_COUNT: 1}
+        out2 = s.incr_many("n0", {MetricKey.INFLIGHT_COUNT: 1, MetricKey.PROMPT_LEN_SUM: 100})
+        assert out2 == {MetricKey.INFLIGHT_COUNT: 2, MetricKey.PROMPT_LEN_SUM: 100}
+
+    def test_incr_many_empty_returns_empty_dict(self):
+        s = PerReplicaStore()
+        assert s.incr_many("n0", {}) == {}
+
+    def test_refresh_returns_full_merged_snapshot_including_preexisting(self):
+        s = PerReplicaStore()
+        s.incr("n0", MetricKey.INFLIGHT_COUNT, 7)  # pre-existing key not in the refresh
+        snap = s.refresh({"n0": {MetricKey.NUM_REQUESTS_RUNNING: 3}})
+        assert snap == {"n0": {MetricKey.INFLIGHT_COUNT: 7, MetricKey.NUM_REQUESTS_RUNNING: 3}}
+
+    def test_refresh_snapshot_is_a_copy(self):
+        s = PerReplicaStore()
+        snap = s.refresh({"n0": {MetricKey.NUM_REQUESTS_RUNNING: 3}})
+        snap["n0"][MetricKey.NUM_REQUESTS_RUNNING] = 999  # mutate must not leak into the store
+        assert s.get("n0", MetricKey.NUM_REQUESTS_RUNNING) == 3
+
+
+class TestDataStoreWriteReturns:
+    """DataStore facade passes the post-write returns through."""
+
+    def test_incr_metric_returns_new_value(self):
+        ds = DataStore()
+        assert ds.incr_metric("n0", MetricKey.INFLIGHT_COUNT) == 1
+
+    def test_incr_metrics_returns_new_values(self):
+        ds = DataStore()
+        out = ds.incr_metrics("n0", {MetricKey.DISPATCHED_COUNT: 1, MetricKey.PROMPT_LEN_SUM: 50})
+        assert out == {MetricKey.DISPATCHED_COUNT: 1, MetricKey.PROMPT_LEN_SUM: 50}
+
+    def test_refresh_metrics_returns_snapshot(self):
+        ds = DataStore()
+        snap = ds.refresh_metrics({"n0": {MetricKey.NUM_REQUESTS_RUNNING: 2}})
+        assert snap == {"n0": {MetricKey.NUM_REQUESTS_RUNNING: 2}}
