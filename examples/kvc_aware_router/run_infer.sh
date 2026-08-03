@@ -41,6 +41,7 @@ done
 export RL_INSIGHT_SERVER_URL="${RL_INSIGHT_SERVER_URL:-http://127.0.0.1:18080}"
 
 python "${SCRIPT_DIR}/parallel_infer.py" \
+    --response-length "${RESPONSE_LENGTH:-4096}" \
     --data-path "${DATA_PATH}" \
     --model-path "${MODEL_PATH}" \
     --agent-config-path "${AGENT_CONFIG}" \
