@@ -38,6 +38,7 @@ from .strategies import (
     StrategyRegistry,
     route,
 )
+from .utils.prefix_cache import resolve_prefix_hashes
 
 logger = get_router_logger("balancer")
 
@@ -226,9 +227,18 @@ class KVCAwareBalancer:
         Raises ``RuntimeError`` if no replica is available. ``request_id`` is
         forwarded so strategies can short-circuit to a sticky-bound replica;
         ``on_acquire`` then refreshes the binding.
+
+        The prompt's prefix-hash chain is resolved once here and threaded
+        through ``route()`` → ``score()`` (so strategies don't re-resolve), then
+        used to record the dispatch in the GPU reverse index — populating the
+        locality signal **immediately**, before vLLM's KV events arrive
+        (6-9s batched). KV-event ``removed``/``clear`` still evict later.
         """
         replicas = [ReplicaInfo(replica_id=sid) for sid in self._servers]
         self._route_calls += 1
+        # Resolve the prefix-hash chain once: shared by score() (locality) and
+        # the post-route dispatch record (populate reverse index immediately).
+        gpu_hash_strs = resolve_prefix_hashes(prompt_ids or [], request_id, self._store) if prompt_ids else None
         t0 = time.perf_counter()
         ranking = route(
             self._strategies,
@@ -236,6 +246,7 @@ class KVCAwareBalancer:
             self._store,
             replicas,
             request_id,
+            gpu_hash_strs,
         )
         dt_ms = (time.perf_counter() - t0) * 1000
         self._route_time_total_s += dt_ms / 1000.0
@@ -243,6 +254,10 @@ class KVCAwareBalancer:
         if not ranking:
             raise RuntimeError("no available replica to route to")
         server_id = ranking[0]
+        # Record the dispatch so later same-prompt rollouts see gpu_hit>0 without
+        # waiting for vLLM KV events. Idempotent with KV-event BlockStored backfill.
+        if gpu_hash_strs:
+            self._store.record_dispatched_prefix(server_id, gpu_hash_strs)
         self._fire("on_acquire", request_id, server_id, prompt_ids)
         logger.info(
             f"request={request_id} routed to server={server_id} (ranking={ranking}, pool={list(self._servers)}, "

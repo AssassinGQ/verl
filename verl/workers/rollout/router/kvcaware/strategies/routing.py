@@ -43,6 +43,7 @@ class RoutingStrategy(Protocol):
         store: Any,
         replicas: list[Any],
         request_id: str | None = None,
+        gpu_hash_strs: list[str] | None = None,
     ) -> list[float]:
         """Score each replica. Larger is better; negatives are allowed.
 
@@ -51,6 +52,13 @@ class RoutingStrategy(Protocol):
         return a pre-built score list that places it first when it is not
         overloaded (see ``KVCacheAwareStrategy``). Strategies that ignore
         stickiness accept ``request_id`` and proceed with their own scoring.
+
+        ``gpu_hash_strs`` is the caller-computed prefix-hash chain (shared
+        across all replicas, computed once in ``route()`` from
+        ``prompt_ids`` + ``request_id``). Strategies that need it
+        (``prefix-load-aware``, ``capacity-token-aware``) consume it directly
+        instead of re-resolving; ``None`` means the caller did not pre-resolve
+        and the strategy may compute it itself.
         """
         ...
 
@@ -66,6 +74,7 @@ def route(
     store: Any,
     replicas: list[Any],
     request_id: str | None = None,
+    gpu_hash_strs: list[str] | None = None,
 ) -> list[str]:
     """Return replica ids ranked best-first.
 
@@ -79,6 +88,11 @@ def route(
         store: ``DataStore`` for metric + sticky-session queries.
         replicas: ``[ReplicaInfo, ...]`` — candidate replicas.
         request_id: session id for sticky-session routing (may be ``None``).
+        gpu_hash_strs: caller-computed prefix-hash chain for ``prompt_ids``
+            (shared across replicas). Computed once by the caller
+            (``acquire_server``) and threaded through here so strategies and the
+            post-route dispatch-recorder share one resolution. ``None`` →
+            resolve inside the strategy (backward-compat).
 
     Returns:
         Replica ids sorted by total score, best first. Falls back to random
@@ -100,6 +114,7 @@ def route(
                 store,
                 replicas,
                 request_id,
+                gpu_hash_strs,
             )
             if len(scores) != n:
                 raise ValueError(f"{name}.score() returned {len(scores)} scores, expected {n}")
@@ -113,7 +128,18 @@ def route(
         for idx in range(n):
             final[idx] += weight * scores[idx]
 
+    # Rank best-first. Among replicas tied at the top score, pick one at random
+    # (instead of the stable sort's always-first bias) so a true cold start or
+    # a same-prompt rollout wave spreads across the pool rather than collapsing
+    # onto pool[0]. Lower ranks keep their stable order — only the winner set
+    # is randomized.
     ranking = sorted(range(n), key=lambda idx: _rank_key(final[idx]), reverse=True)
+    top_score = _rank_key(final[ranking[0]])
+    top_ties = [idx for idx in ranking if _rank_key(final[idx]) == top_score]
+    if len(top_ties) > 1:
+        chosen = random.choice(top_ties)
+        # Move the random pick to the head; keep the rest in stable order.
+        ranking = [chosen] + [idx for idx in ranking if idx != chosen]
     scores_str = ", ".join(f"{replicas[idx].replica_id}={final[idx]:.4f}" for idx in ranking)
     logger.info(f"route(): replicas={n} ranking=[{scores_str}]")
     return [replicas[idx].replica_id for idx in ranking]

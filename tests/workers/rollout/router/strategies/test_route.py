@@ -100,7 +100,7 @@ class TestStrategyRegistry:
             pass
 
         class _DummyStrategy:
-            def score(self, prompt_ids, provider, replicas, request_id=None, sticky_table=None):
+            def score(self, prompt_ids, provider, replicas, request_id=None, gpu_hash_strs=None):
                 return [0.0] * len(replicas)
 
         StrategyRegistry.register(_DummyConfig, _DummyStrategy)
@@ -149,17 +149,17 @@ class ConstantStrategy:
     def __init__(self, scores):
         self._scores = scores
 
-    def score(self, prompt_ids, provider, replicas, request_id=None, sticky_table=None):
+    def score(self, prompt_ids, provider, replicas, request_id=None, gpu_hash_strs=None):
         return list(self._scores)
 
 
 class BadLengthStrategy:
-    def score(self, prompt_ids, provider, replicas, request_id=None, sticky_table=None):
+    def score(self, prompt_ids, provider, replicas, request_id=None, gpu_hash_strs=None):
         return [1.0]
 
 
 class RaisingStrategy:
-    def score(self, prompt_ids, provider, replicas, request_id=None, sticky_table=None):
+    def score(self, prompt_ids, provider, replicas, request_id=None, gpu_hash_strs=None):
         raise KeyError("boom")
 
 

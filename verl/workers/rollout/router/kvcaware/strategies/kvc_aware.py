@@ -234,12 +234,17 @@ class KVCacheAwareStrategy:
         store: DataStore,
         replicas: list[ReplicaInfo],
         request_id: str | None = None,
+        gpu_hash_strs: list[str] | None = None,
     ) -> list[float]:
         """Score each replica. Larger is better.
 
         After the sticky short-circuit misses, the ``slow_cut`` mode selects the
         fallback scoring: ``prefix-load-aware`` → ``S = α·S_cache + (1-α)·S_load``;
         ``least-inflight`` → ``-INFLIGHT_COUNT`` (verl GlobalRequestLoadBalancer-style).
+
+        ``gpu_hash_strs`` is the caller-computed prefix-hash chain (shared
+        across replicas, computed once in ``route()``). When ``None``, resolve
+        here — backward-compat for direct callers that don't pre-resolve.
         """
         if not isinstance(replicas, list):
             raise StrategyError(f"replicas must be a list, got {type(replicas).__name__}")
@@ -256,7 +261,8 @@ class KVCacheAwareStrategy:
             if self.slow_cut == SlowCut.LEAST_INFLIGHT:
                 return [-store.get_metric(r.replica_id, MetricKey.INFLIGHT_COUNT) for r in replicas]
             # Hash-resolving slow_cuts share one resolution across all replicas.
-            gpu_hash_strs = resolve_prefix_hashes(prompt_ids or [], request_id, store)
+            if gpu_hash_strs is None:
+                gpu_hash_strs = resolve_prefix_hashes(prompt_ids or [], request_id, store)
             if self.slow_cut == SlowCut.PREFIX_LOAD_AWARE:
                 return self._prefix_load_aware(store, replicas, gpu_hash_strs)
             if self.slow_cut == SlowCut.CAPACITY_TOKEN_AWARE:
@@ -357,28 +363,30 @@ class KVCacheAwareStrategy:
         prompt_ids: list[int],
         gpu_hash_strs: list[str],
     ) -> list[float]:
-        """Capacity-gated token routing (discrete: winner=STICKY_TOP_SCORE, rest 0).
+        """Capacity-gated token routing (discrete: top replicas get STICKY_TOP_SCORE).
 
         For each replica ``i``::
 
-            avail[i]     = cap × (1 - kv_cache_usage_perc[i])   # free tokens (no cache)
-            need[i]      = len(prompt_ids) × (1 - gpu_hit[i])    # prefill this req adds
-            remaining[i] = avail[i] - need[i]                    # free tokens after assign
+            need[i]      = len(prompt_ids) × (1 - gpu_hit[i])       # prefill this req adds
+            remaining[i] = avail[i] - need[i]                       # free after assign
             eligible[i]  = avail[i] >= cap × (1 - load_threshold)   # pure capacity gate
 
-        pick ``argmin(inflight_tokens)`` (least in-flight tokens wins) to keep
-        the first wave from collapsing onto ``pool[0]``.
-        Otherwise pick ``argmax(eligible, remaining)``.
+        Per-replica switch — whichever replica gets polled first switches
+        first. Ranking: replicas above the capacity gate rank before those
+        below, each group ordered by ``remaining`` descending. Replicas tied
+        at the top ``remaining`` all get ``STICKY_TOP_SCORE`` — ``route()``
+        breaks the tie at random (anti pool[0]-collapse).
         """
         n = len(replicas)
         cap = self._total_token_capacity(store)
         plen = len(prompt_ids) if prompt_ids else 0
         rows: list[dict] = []
         for replica in replicas:
-            kv_perc = store.get_metric(replica.replica_id, MetricKey.KV_CACHE_USAGE_PERC) or 0.0
+            kv_perc = store.get_metric(replica.replica_id, MetricKey.KV_CACHE_USAGE_PERC) or 0
             inflight = store.get_metric(replica.replica_id, MetricKey.INFLIGHT_COUNT) or 0
             inflight_tokens = store.get_metric(replica.replica_id, MetricKey.INFLIGHT_TOKENS) or 0
             s_cache, gpu_hit = self._cache_score(store, replica, gpu_hash_strs)
+
             avail = cap * (1.0 - kv_perc)
             need = plen * (1.0 - gpu_hit)
             remaining = avail - need
@@ -399,37 +407,43 @@ class KVCacheAwareStrategy:
             )
 
         thresh = cap * (1.0 - self.load_threshold)
-        cold_start = store.get_sticky_binding(request_id) is None
-        if cold_start:
-            top = min(range(n), key=lambda i: rows[i]["inflight_tokens"])
-            logger.info("score(): CAPACITY_TOKEN_AWARE cold start → min inflight_tokens")
-        else:
-            eligible = [i for i in range(n) if rows[i]["avail"] >= thresh]
-            if not eligible:
-                top = max(range(n), key=lambda i: rows[i]["remaining"])
-                logger.info("score(): CAPACITY_TOKEN_AWARE no eligible → max remaining")
-            else:
-                top = max(eligible, key=lambda i: rows[i]["remaining"])
+        # Unified ranking: eligible (avail >= thresh) first, then by remaining
+        # desc within each group. ``eligible`` is a bool (1 = above gate) so it
+        # sorts before 0; among equal (eligible, remaining) the order is
+        # arbitrary and left to route()'s random tie-break.
+        order = sorted(
+            range(n),
+            key=lambda i: (1 if rows[i]["avail"] >= thresh else 0, rows[i]["remaining"]),
+            reverse=True,
+        )
+        best_remaining = rows[order[0]]["remaining"]
+        top_idx = [i for i in order if rows[i]["remaining"] == best_remaining and rows[i]["avail"] >= thresh]
+        # When no replica clears the gate, ``order``'s head is the largest
+        # ``remaining`` among the all-overloaded set; tie those too.
+        if not top_idx:
+            top_idx = [order[0]]
 
         for i, row in enumerate(rows):
-            tag = " ← WINNER" if i == top else ""
+            tag = " ← WINNER" if i in top_idx else ""
             logger.info(
                 f"score(): replica={row['replica'].replica_id} kv_perc={row['kv_perc']:.3f} "
                 f"gpu_hit={row['gpu_hit']:.3f} inflight={row['inflight']} "
                 f"avail={row['avail']:.0f} need={row['need']:.0f} "
                 f"max_num_batched_tokens={self._max_num_batched_tokens} inflight_tokens={row['inflight_tokens']:} "
-                f"remaining={row['remaining']:.0f}{tag}"
+                f"remaining={row['remaining']:.0f} {tag}"
             )
-        winner = rows[top]["replica"].replica_id
+        winners = [rows[i]["replica"].replica_id for i in top_idx]
         logger.info(
-            f"score(): CAPACITY_TOKEN_AWARE winner={winner} "
-            f"(kv_perc={rows[top]['kv_perc']:.3f}, remaining={rows[top]['remaining']:.0f})"
+            f"score(): CAPACITY_TOKEN_AWARE winners={winners} "
+            f"(remaining={rows[top_idx[0]]['remaining']:.0f}, "
+            f"kv_perc={rows[top_idx[0]]['kv_perc']:.3f})"
         )
         # Per-replica capacity signal for the plot (mirrors route-load in prefix-load-aware).
         cap_loads = {row["replica"].replica_id: row["remaining"] for row in rows}
         logger.info(f"route-capacity remaining={cap_loads}")
         scores = [0.0] * n
-        scores[top] = STICKY_TOP_SCORE
+        for i in top_idx:
+            scores[i] = STICKY_TOP_SCORE
         return scores
 
 
