@@ -158,6 +158,26 @@ def _resolve_router_strategy(rollout_config: RolloutConfig) -> str:
     return rollout_config.get("router_strategy", "global_sticky_inflight")
 
 
+def _router_actor_options() -> dict[str, Any]:
+    """Actor options pinning the router to the driver's node.
+
+    Unpinned, a multi-node cluster places the router on a random node each job,
+    so its polling loops, logs, and ray-start env snapshot vary run to run.
+    Pinning keeps all of that on one deterministic host (the head, where the
+    driver lives). soft=False: if this node is gone the run fails loudly
+    instead of drifting — the driver on the same node is already a single
+    point of failure, so no availability is lost.
+    """
+    from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+    return {
+        "scheduling_strategy": NodeAffinitySchedulingStrategy(
+            node_id=ray.get_runtime_context().get_node_id(),
+            soft=False,
+        )
+    }
+
+
 def get_router_handle(servers: dict[str, Any], rollout_config: RolloutConfig) -> Any:
     """Create a load balancer instance from router configuration."""
     strategy = _resolve_router_strategy(rollout_config)
@@ -169,6 +189,7 @@ def get_router_handle(servers: dict[str, Any], rollout_config: RolloutConfig) ->
     config = OmegaConf.to_container(OmegaConf.create(router_cfg), resolve=True)
     config["full_determinism"] = getattr(rollout_config, "full_determinism", False)
 
+    options = _router_actor_options()
     if _is_ray_actor_class(cls):
-        return cls.remote(servers=servers, config=config)
-    return ray.remote(cls).remote(servers=servers, config=config)
+        return cls.options(**options).remote(servers=servers, config=config)
+    return ray.remote(cls).options(**options).remote(servers=servers, config=config)

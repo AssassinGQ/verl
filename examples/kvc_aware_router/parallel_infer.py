@@ -382,7 +382,10 @@ def run_inference(
         os.environ["MOONCAKE_CONFIG_PATH"] = os.path.expanduser(mooncake_config_path)
 
     if not ray.is_initialized():
-        ray.init(_system_config={"idle_worker_killing_time_threshold_ms": _RAY_IDLE_WORKER_TIMEOUT_MS})
+        if os.environ.get("RAY_ADDRESS"):
+            ray.init(address="auto")
+        else:
+            ray.init(_system_config={"idle_worker_killing_time_threshold_ms": _RAY_IDLE_WORKER_TIMEOUT_MS})
 
     config = _load_config(
         model_path=model_path,
@@ -444,6 +447,16 @@ def run_inference(
         )
 
     result = _report(samples, uids, captured_scores)
+
+    # Success sentinel for the experiment driver's grep; printed only when at
+    # least one trajectory score was captured (all-failed runs stay silent).
+    if captured_scores:
+        print(
+            f"\n=> Resolved {result['resolved']}/{result['total']} samples "
+            f"({100.0 * result['resolved'] / max(result['total'], 1):.2f}%), "
+            f"Mean RM Score: {result['mean_score']:.4f}\n",
+            flush=True,
+        )
 
     if result_path:
         out = os.path.expanduser(result_path)
