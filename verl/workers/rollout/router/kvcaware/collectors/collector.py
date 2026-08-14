@@ -26,7 +26,7 @@ from ..config.collector import CollectorConfig
 from ..insight import WriteEvent, WriteKind, emitter
 from ..logging import get_router_logger
 from ..store.data_store import DataStore
-from ..types import EmitKey, MetricKey
+from ..types import EmitKey, Layer, MetricKey
 from .decoder import Decoder, KVCacheUpdate, MetricsUpdate, StickyUpdate
 from .transport.base import Transport
 
@@ -149,7 +149,16 @@ class Collector:
                 tmp_loop.close()
 
     def _write_kv_update(self, update: KVCacheUpdate) -> None:
-        """Write KVCacheUpdate via DataStore, then emit a periodic kv-events tally."""
+        """Write KVCacheUpdate via DataStore, then emit a periodic kv-events tally.
+
+        A real ``BlockRemoved`` (GPU layer) is the only thing allowed to
+        decrement ``INFLIGHT_TOKENS`` (see ``_write_metrics_update`` — release
+        no longer does). This makes the gauge "cumulative acquire-time
+        estimate − cumulative real eviction", tracking actual GPU KV pressure
+        instead of request lifetime. Uses the decoder-learned ``block_size``
+        (BlockRemoved events don't carry one — only BlockStored does), so no
+        decrement happens until at least one BlockStored has been seen.
+        """
         if update.block_size is not None:
             self._data_store.set_block_size(update.block_size)
         if update.clear_all:
@@ -160,6 +169,16 @@ class Collector:
         for layer, hashes in update.add_blocks.items():
             if hashes:
                 self._data_store.add_kv_blocks(update.node_id, hashes, layer=layer)
+
+        n_removed_gpu = len(update.remove_blocks.get(Layer.GPU, []))
+        block_size = self._data_store.get_block_size()
+        if n_removed_gpu and block_size:
+            self._data_store.incr_metric(
+                update.node_id,
+                MetricKey.INFLIGHT_TOKENS,
+                -(n_removed_gpu * block_size),
+                floor=0,
+            )
 
         # Tally for periodic summary — observe BlockStored/BlockRemoved flow.
         n_added = sum(len(v) for v in update.add_blocks.values())
@@ -222,21 +241,29 @@ class Collector:
                     deltas[MetricKey.INFLIGHT_TURN_SUM] = -self._data_store.get_per_request(
                         update.request_id, "turn", 0
                     )
-            # INFLIGHT_TOKENS counts KV occupancy, not raw prompt length. Replace
-            # the decoder's prompt_len delta with the acquire-time miss_tokens
-            # (plen × (1 - gpu_hit)) stashed in PerRequestStore by acquire_server.
-            # acquire adds it; release subtracts the same value (symmetric), then
-            # the per-request entry is freed. Falls back to prompt_len (the old
-            # double-counted semantics) only when miss_tokens was never set —
-            # e.g. requests routed without a strategy that resolves gpu_hit.
+            # INFLIGHT_TOKENS approximates KV occupancy: acquire adds the
+            # acquire-time miss_tokens estimate (plen × (1 - gpu_hit)) stashed
+            # in PerRequestStore by acquire_server. It is deliberately NOT
+            # subtracted on release — request completion does not free KV
+            # blocks; vLLM keeps them in the free-but-cached pool until real
+            # LRU eviction. The decrement instead comes from BlockRemoved
+            # events (see ``_write_kv_update``), so the gauge tracks
+            # "cumulative estimated occupancy − cumulative real eviction",
+            # closer to vLLM's own kv_cache_usage_perc than a request-lifetime
+            # counter. Falls back to prompt_len (the old symmetric semantics)
+            # only on acquire when miss_tokens was never set — e.g. requests
+            # routed without a strategy that resolves gpu_hit; release always
+            # drops the INFLIGHT_TOKENS delta the decoder emitted and frees
+            # the per-request entry once its purpose (acquire lookup) is done.
             if MetricKey.INFLIGHT_TOKENS in deltas and update.request_id is not None:
-                miss_tokens = self._data_store.get_per_request(update.request_id, "miss_tokens", None)
-                if miss_tokens is not None:
-                    sign = 1 if is_acquire else -1
-                    deltas[MetricKey.INFLIGHT_TOKENS] = sign * int(miss_tokens)
-                    if is_release:
-                        self._data_store.del_per_request(update.request_id, "miss_tokens")
-            new_values = self._data_store.incr_metrics(update.node_id, deltas)
+                if is_acquire:
+                    miss_tokens = self._data_store.get_per_request(update.request_id, "miss_tokens", None)
+                    if miss_tokens is not None:
+                        deltas[MetricKey.INFLIGHT_TOKENS] = int(miss_tokens)
+                elif is_release:
+                    deltas.pop(MetricKey.INFLIGHT_TOKENS, None)
+                    self._data_store.del_per_request(update.request_id, "miss_tokens")
+            new_values = self._data_store.incr_metrics(update.node_id, deltas, floor={MetricKey.INFLIGHT_TOKENS: 0})
             if emitter.enabled() and (is_acquire or is_release):
                 emitter.on_write(
                     WriteEvent(

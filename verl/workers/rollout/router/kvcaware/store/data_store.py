@@ -229,29 +229,44 @@ class DataStore:
 
     # ── PerReplicaStore incremental write ──────────────────────────────────
 
-    def incr_metric(self, node_id: str, key: str, delta: int | float = 1) -> int | float:
+    def incr_metric(
+        self, node_id: str, key: str, delta: int | float = 1, floor: int | float | None = None
+    ) -> int | float:
         """Apply a signed delta to one metric for one node (inflight ±1).
 
         Routes to ``PerReplicaStore.incr`` (not ``refresh``) so a stateless delta
         emitter (``InflightDecoder``) can move a running counter without
         tracking the absolute value itself.
 
+        Args:
+            floor: If given, clamp the post-delta value to ``max(new, floor)``.
+
         Returns:
             The new value of ``key``.
         """
-        return self._metrics.incr(node_id, key, delta)
+        return self._metrics.incr(node_id, key, delta, floor=floor)
 
-    def incr_metrics(self, node_id: str, deltas: dict[str, int | float]) -> dict[str, int | float]:
+    def incr_metrics(
+        self,
+        node_id: str,
+        deltas: dict[str, int | float],
+        floor: dict[str, int | float] | None = None,
+    ) -> dict[str, int | float]:
         """Apply multiple signed deltas to one node under a single lock.
 
         Batched variant of :meth:`incr_metric` for the ``on_acquire`` decoder,
         which emits several deltas per dispatch (INFLIGHT / DISPATCHED /
         PROMPT_LEN_SUM) — batching avoids one lock cycle per key on the hot path.
 
+        Args:
+            floor: Optional ``{canonical_key: floor_value}`` passed through to
+                ``PerReplicaStore.incr_many`` — clamps keys decremented by a
+                source independent of whatever incremented them.
+
         Returns:
             ``{canonical_key: new_value}`` for every key in ``deltas``.
         """
-        return self._metrics.incr_many(node_id, deltas)
+        return self._metrics.incr_many(node_id, deltas, floor=floor)
 
     # ── Sticky bindings (a per-request value stored under _STICKY_KEY) ───
 
