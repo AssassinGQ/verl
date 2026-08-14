@@ -387,7 +387,7 @@ class KVCacheAwareStrategy:
             inflight_tokens = store.get_metric(replica.replica_id, MetricKey.INFLIGHT_TOKENS) or 0
             s_cache, gpu_hit = self._cache_score(store, replica, gpu_hash_strs)
 
-            avail = cap * (1.0 - kv_perc)
+            avail = cap - inflight_tokens
             need = plen * (1.0 - gpu_hit)
             remaining = avail - need
             if emitter.enabled():

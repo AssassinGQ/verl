@@ -222,6 +222,20 @@ class Collector:
                     deltas[MetricKey.INFLIGHT_TURN_SUM] = -self._data_store.get_per_request(
                         update.request_id, "turn", 0
                     )
+            # INFLIGHT_TOKENS counts KV occupancy, not raw prompt length. Replace
+            # the decoder's prompt_len delta with the acquire-time miss_tokens
+            # (plen × (1 - gpu_hit)) stashed in PerRequestStore by acquire_server.
+            # acquire adds it; release subtracts the same value (symmetric), then
+            # the per-request entry is freed. Falls back to prompt_len (the old
+            # double-counted semantics) only when miss_tokens was never set —
+            # e.g. requests routed without a strategy that resolves gpu_hit.
+            if MetricKey.INFLIGHT_TOKENS in deltas and update.request_id is not None:
+                miss_tokens = self._data_store.get_per_request(update.request_id, "miss_tokens", None)
+                if miss_tokens is not None:
+                    sign = 1 if is_acquire else -1
+                    deltas[MetricKey.INFLIGHT_TOKENS] = sign * int(miss_tokens)
+                    if is_release:
+                        self._data_store.del_per_request(update.request_id, "miss_tokens")
             new_values = self._data_store.incr_metrics(update.node_id, deltas)
             if emitter.enabled() and (is_acquire or is_release):
                 emitter.on_write(
