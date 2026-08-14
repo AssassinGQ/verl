@@ -63,7 +63,7 @@ class PerReplicaStore:
             return node[key]
         return METRIC_SPECS[key]["default"]
 
-    def incr(self, node_id: str, key: str, delta: int | float = 1) -> int | float:
+    def incr(self, node_id: str, key: str, delta: int | float = 1, floor: int | float | None = None) -> int | float:
         """Apply a numeric delta to one key for one node (inflight ±1).
 
         Unlike ``refresh`` (batch merge overwrite), this is an incremental
@@ -75,6 +75,11 @@ class PerReplicaStore:
             node_id: Target node.
             key: Canonical metric key (must be in ``METRIC_SPECS``).
             delta: Signed delta to add (default +1).
+            floor: If given, clamp the post-delta value to ``max(new, floor)``.
+                Needed for gauges fed by two independent, unsynchronized
+                sources (e.g. acquire-time estimate vs. eviction-driven KV
+                events) where a burst of decrements could otherwise drive the
+                value negative.
 
         Returns:
             The new value of ``key`` after applying ``delta``.
@@ -84,9 +89,15 @@ class PerReplicaStore:
         """
         if key not in METRIC_SPECS:
             raise KeyError(f"Unknown metric key '{key}'. Valid keys: {sorted(METRIC_SPECS.keys())}")
-        return self._apply(node_id, {key: delta})[key]
+        floors = {key: floor} if floor is not None else None
+        return self._apply(node_id, {key: delta}, floor=floors)[key]
 
-    def incr_many(self, node_id: str, deltas: dict[str, int | float]) -> dict[str, int | float]:
+    def incr_many(
+        self,
+        node_id: str,
+        deltas: dict[str, int | float],
+        floor: dict[str, int | float] | None = None,
+    ) -> dict[str, int | float]:
         """Apply multiple signed deltas to one node under a single lock.
 
         Same incremental semantics as :meth:`incr` (reads current, adds delta,
@@ -98,6 +109,8 @@ class PerReplicaStore:
         Args:
             node_id: Target node.
             deltas: ``{canonical_key: signed_delta}`` (all keys in ``METRIC_SPECS``).
+            floor: Optional ``{canonical_key: floor_value}`` for keys whose
+                post-delta value should be clamped to ``max(new, floor_value)``.
 
         Returns:
             ``{canonical_key: new_value}`` for every key in ``deltas``.
@@ -110,14 +123,27 @@ class PerReplicaStore:
         bad = [k for k in deltas if k not in METRIC_SPECS]
         if bad:
             raise KeyError(f"Unknown metric keys: {sorted(bad)}. Valid keys: {sorted(METRIC_SPECS.keys())}")
-        return self._apply(node_id, deltas)
+        return self._apply(node_id, deltas, floor=floor)
 
-    def _apply(self, node_id: str, deltas: dict[str, int | float]) -> dict[str, int | float]:
+    def _apply(
+        self,
+        node_id: str,
+        deltas: dict[str, int | float],
+        floor: dict[str, int | float] | None = None,
+    ) -> dict[str, int | float]:
         """Apply signed deltas to one node under one lock (caller validates keys).
 
         Each key falls back to its ``METRIC_SPECS`` default before adding the
         delta, so the writer stays stateless — it only emits the +/-delta.
         Shared by :meth:`incr` (single key) and :meth:`incr_many` (batch).
+
+        Args:
+            floor: Optional ``{canonical_key: floor_value}`` — keys present here
+                are clamped to ``max(current + delta, floor_value)`` after the
+                delta is applied. Needed when a gauge is decremented by a source
+                independent of whatever incremented it (e.g. KV-event-driven
+                eviction vs. acquire-time estimate), where accumulated drift
+                could otherwise push the value below a meaningful floor (usually 0).
 
         Returns:
             ``{canonical_key: new_value}`` after applying each delta — computed
@@ -129,6 +155,8 @@ class PerReplicaStore:
             new_values: dict[str, int | float] = {}
             for key, delta in deltas.items():
                 new = node.get(key, METRIC_SPECS[key]["default"]) + delta
+                if floor is not None and key in floor:
+                    new = max(new, floor[key])
                 node[key] = new
                 new_values[key] = new
             return new_values

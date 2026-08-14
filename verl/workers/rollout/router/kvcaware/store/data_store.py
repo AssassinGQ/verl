@@ -123,6 +123,29 @@ class DataStore:
         """
         self._kv.add_blocks(node_id, block_hashes, layer=layer)
 
+    def record_dispatched_prefix(self, replica_id: str, hash_strs: list[str]) -> None:
+        """Mark ``hash_strs`` as dispatched to ``replica_id`` in the GPU reverse index.
+
+        Called at acquire time (see ``KVCAwareBalancer.acquire_server``) so the
+        prefix→replica reverse index that ``get_layer_prefix_hit_rate`` walks is
+        populated **immediately**, without waiting for vLLM's KV events (which
+        arrive in 6-9s batches). The same hashes later arrive via KV-event
+        ``BlockStored`` → ``add_kv_blocks``; that path is idempotent
+        (``add_blocks`` dedups via set), so the backfill is a no-op.
+
+        KV-event ``BlockRemoved``/``AllBlocksCleared`` still evict entries from
+        the reverse index — so once vLLM actually LRU-evicts a prefix, the
+        locality signal decays correctly (with the KV-event batch delay).
+
+        Args:
+            replica_id: The replica the prompt was routed to.
+            hash_strs: The prompt's full-block chained prefix hashes (the same
+                ``gpu_hash_strs`` ``score()`` consumes — computed once in
+                ``acquire_server`` and threaded through ``route()``).
+        """
+        if hash_strs:
+            self._kv.add_blocks(replica_id, hash_strs, layer=Layer.GPU)
+
     def remove_kv_blocks(self, node_id: str, block_hashes: list[str], layer: Layer = Layer.GPU) -> None:
         """Remove KV cache blocks from a node.
 
@@ -206,29 +229,44 @@ class DataStore:
 
     # ── PerReplicaStore incremental write ──────────────────────────────────
 
-    def incr_metric(self, node_id: str, key: str, delta: int | float = 1) -> int | float:
+    def incr_metric(
+        self, node_id: str, key: str, delta: int | float = 1, floor: int | float | None = None
+    ) -> int | float:
         """Apply a signed delta to one metric for one node (inflight ±1).
 
         Routes to ``PerReplicaStore.incr`` (not ``refresh``) so a stateless delta
         emitter (``InflightDecoder``) can move a running counter without
         tracking the absolute value itself.
 
+        Args:
+            floor: If given, clamp the post-delta value to ``max(new, floor)``.
+
         Returns:
             The new value of ``key``.
         """
-        return self._metrics.incr(node_id, key, delta)
+        return self._metrics.incr(node_id, key, delta, floor=floor)
 
-    def incr_metrics(self, node_id: str, deltas: dict[str, int | float]) -> dict[str, int | float]:
+    def incr_metrics(
+        self,
+        node_id: str,
+        deltas: dict[str, int | float],
+        floor: dict[str, int | float] | None = None,
+    ) -> dict[str, int | float]:
         """Apply multiple signed deltas to one node under a single lock.
 
         Batched variant of :meth:`incr_metric` for the ``on_acquire`` decoder,
         which emits several deltas per dispatch (INFLIGHT / DISPATCHED /
         PROMPT_LEN_SUM) — batching avoids one lock cycle per key on the hot path.
 
+        Args:
+            floor: Optional ``{canonical_key: floor_value}`` passed through to
+                ``PerReplicaStore.incr_many`` — clamps keys decremented by a
+                source independent of whatever incremented them.
+
         Returns:
             ``{canonical_key: new_value}`` for every key in ``deltas``.
         """
-        return self._metrics.incr_many(node_id, deltas)
+        return self._metrics.incr_many(node_id, deltas, floor=floor)
 
     # ── Sticky bindings (a per-request value stored under _STICKY_KEY) ───
 
