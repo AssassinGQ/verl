@@ -348,6 +348,50 @@ class Panel:
         if self.ylim_top is not None:
             ax.set_ylim(top=self.ylim_top)
         ax.grid(True, alpha=0.3)
+        self._annotate_stats(ax, data, order)
+
+    # -- statistics annotation --
+    def stats(self, data: dict, order: list) -> str:
+        """Panel-wide aggregate mean/std over all replicas' points.
+
+        Accumulating panels (cumulative totals — evict, cumul. completed)
+        override to report the last value instead, since mean/std of a
+        monotonically rising series is not informative.
+        """
+        vals = []
+        for rep in order:
+            for _t, v in self.points_for(data, rep):
+                if v == v:  # skip NaN (matplotlib skips them; stats should too)
+                    vals.append(float(v))
+        return self._mean_std_str(vals)
+
+    def _annotate_stats(self, ax, data, order) -> None:
+        """Draw the panel-wide μ/σ (or last) annotation in the top-right."""
+        txt = self.stats(data, order)
+        if not txt:
+            return
+        ax.text(
+            0.99,
+            0.95,
+            txt,
+            transform=ax.transAxes,
+            ha="right",
+            va="top",
+            fontsize=7,
+            color="#333333",
+            bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#bbbbbb", alpha=0.75),
+        )
+
+    @staticmethod
+    def _mean_std_str(vals: list) -> str:
+        if not vals:
+            return ""
+        import statistics
+
+        m = statistics.mean(vals)
+        # population stdev — panels are full samples, not a drawn subset.
+        s = statistics.pstdev(vals) if len(vals) > 1 else 0.0
+        return f"μ={m:.3g} σ={s:.3g}"
 
     def summarize(self, data: dict, rep: str) -> str:
         return self._summary(self.points_for(data, rep)) if self._summary else ""
@@ -503,6 +547,22 @@ class CumulativePanel(Panel):
     :class:`EvictPanel` counts the drops (block evictions); override
     :meth:`accumulate` for other cumulative semantics.
     """
+
+    def stats(self, data: dict, order: list) -> str:
+        """Cumulative panels report the final aggregate value, not μ/σ.
+
+        A monotonically rising series' mean/std (≈ mid/quarter-span) is not
+        informative; the last value is the realized total — what matters here.
+        Sums the last value across replicas (one evictions/completed total).
+        """
+        last_vals = []
+        for rep in order:
+            pts = self.points_for(data, rep)
+            if pts and pts[-1][1] == pts[-1][1]:
+                last_vals.append(float(pts[-1][1]))
+        if not last_vals:
+            return ""
+        return f"Σlast={sum(last_vals):.3g}"
 
     def derive(self, retained: dict):
         out = {}
@@ -753,6 +813,12 @@ class RouteLatencyPanel(Panel):
         # Global series lives under _GLOBAL, not under a replica — ignore `rep`.
         pts = data.get(self.key, {}).get(self._GLOBAL, [])
         return self._summary(pts) if self._summary else ""
+
+    def stats(self, data, order) -> str:
+        # Global single-line series: aggregate over _GLOBAL, not per-replica.
+        pts = data.get(self.key, {}).get(self._GLOBAL, [])
+        vals = [float(v) for _t, v in pts if v == v]
+        return self._mean_std_str(vals)
 
 
 class StickyOverloadPanel(Panel):

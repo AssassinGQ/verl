@@ -408,18 +408,27 @@ class KVCacheAwareStrategy:
 
         thresh = cap * (1.0 - self.load_threshold)
         # Unified ranking: eligible (avail >= thresh) first, then by remaining
-        # desc within each group. ``eligible`` is a bool (1 = above gate) so it
-        # sorts before 0; among equal (eligible, remaining) the order is
-        # arbitrary and left to route()'s random tie-break.
+        # desc, then by need asc. Among replicas with equal remaining, the one
+        # with the smallest ``need`` wins — need = plen×(1-gpu_hit), so smaller
+        # need means more prefix-cache overlap (locality-first tie-break). Only
+        # replicas tying on (eligible, remaining, need) get STICKY_TOP_SCORE
+        # together; route() then breaks that residual tie at random.
+        # ``eligible`` is a bool (1 = above gate) so it sorts before 0.
         order = sorted(
             range(n),
-            key=lambda i: (1 if rows[i]["avail"] >= thresh else 0, rows[i]["remaining"]),
+            key=lambda i: (1 if rows[i]["avail"] >= thresh else 0, rows[i]["remaining"], -rows[i]["need"]),
             reverse=True,
         )
         best_remaining = rows[order[0]]["remaining"]
-        top_idx = [i for i in order if rows[i]["remaining"] == best_remaining and rows[i]["avail"] >= thresh]
+        best_need = rows[order[0]]["need"]
+        top_idx = [
+            i
+            for i in order
+            if rows[i]["remaining"] == best_remaining and rows[i]["need"] == best_need and rows[i]["avail"] >= thresh
+        ]
         # When no replica clears the gate, ``order``'s head is the largest
-        # ``remaining`` among the all-overloaded set; tie those too.
+        # ``remaining`` (then smallest ``need``) among the all-overloaded set;
+        # tie those too.
         if not top_idx:
             top_idx = [order[0]]
 

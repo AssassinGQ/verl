@@ -255,23 +255,15 @@ class KVCAwareBalancer:
         if not ranking:
             raise RuntimeError("no available replica to route to")
         server_id = ranking[0]
-        # Record the dispatch so later same-prompt rollouts see gpu_hit>0 without
-        # waiting for vLLM KV events. Idempotent with KV-event BlockStored backfill.
-        if gpu_hash_strs:
-            self._store.record_dispatched_prefix(server_id, gpu_hash_strs)
-        # Estimate this request's KV-cache occupancy as the prefix-cache *miss*
-        # tokens (plen × (1 - gpu_hit)) — what vLLM will actually have to prefill
-        # and store. Stash it per-request so the InflightDecoder can keep the
-        # INFLIGHT_TOKENS gauge symmetric: acquire adds this, release subtracts
-        # the same value (no acquire-time gpu_hit at release). This replaces the
-        # old "sum of prompt_len" semantics, which double-counted shared prefixes
-        # (8 same-prompt rollouts summed 8× the prompt len but vLLM stored 1×).
+
         if request_id is not None and prompt_ids:
             gpu_hit = 0.0
             if gpu_hash_strs:
                 gpu_hit = self._store.get_layer_prefix_hit_rate(server_id, gpu_hash_strs, Layer.GPU) or 0.0
             miss_tokens = int(len(prompt_ids) * (1.0 - gpu_hit))
             self._store.set_per_request(request_id, "miss_tokens", miss_tokens)
+        if gpu_hash_strs:
+            self._store.record_dispatched_prefix(server_id, gpu_hash_strs)
         self._fire("on_acquire", request_id, server_id, prompt_ids)
         logger.info(
             f"request={request_id} routed to server={server_id} (ranking={ranking}, pool={list(self._servers)}, "
