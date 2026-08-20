@@ -159,6 +159,7 @@ step2_rl_insight() {
     log "=== Step 2: rl-insight server on head (${HEAD_IP}:${RL_INSIGHT_PORT}), up for the whole matrix ==="
     export VERL_RL_INSIGHT_ENABLE=1
     export RL_INSIGHT_SERVER_URL="http://${HEAD_IP}:${RL_INSIGHT_PORT}"
+    rl-insight server stop
     rl-insight server start --detach 2>/dev/null || true   # already-running is fine
     trap 'rl-insight server stop 2>/dev/null || true' EXIT
     log "rl-insight up; workers scrape via RL_INSIGHT_SERVER_URL=${RL_INSIGHT_SERVER_URL}"
