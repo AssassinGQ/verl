@@ -17,6 +17,7 @@ import inspect
 import json
 import logging
 import os
+import socket
 import uuid
 from pprint import pprint
 from typing import Any, Callable, Optional
@@ -164,6 +165,7 @@ class vLLMHttpServer:
         # used for http server
         self._server_address = ray.util.get_node_ip_address().strip("[]")
         self._server_port = None
+        self._kv_events_endpoints = None
 
         # used for controlling vllm server profiler
         profiler_config = self.config.profiler
@@ -216,6 +218,22 @@ class vLLMHttpServer:
         """Get http server address and port."""
         assert self._server_port is not None, "http server is not launched, port is None"
         return self._server_address, self._server_port
+
+    def get_kv_events_endpoints(self):
+        """Get kv-events ZMQ endpoint addresses.
+
+        Returns list [endpoint, replay_endpoint] or None.
+        """
+        return self._kv_events_endpoints
+
+    def get_rollout_config(self):
+        """Get the RolloutConfig (e.g. max_num_seqs, max_model_len).
+
+        Lets external routers fetch server-side config (vLLM doesn't expose
+        these on /metrics) via the same handler-getter pattern as
+        ``get_server_address``.
+        """
+        return self.config
 
     @property
     def lora_as_adapter(self) -> bool:
@@ -1020,6 +1038,94 @@ class vLLMHttpServer:
             # Work around multimodal processor cache desync across pause/resume.
             # See: https://github.com/vllm-project/vllm/pull/43001/
             engine_kwargs.setdefault("mm_processor_cache_gb", 0)
+
+        # kv-events ports: base + replica_rank*step + idx*dp_size (deterministic, no
+        # cross-replica TOCTOU). idx*dp_size + step>=2*dp_size keep endpoint/replay apart
+        # under vLLM's per-endpoint +dp_rank. Tunable: VERL_KV_EVENTS_BASE_PORT / _STEP.
+        kv_events_config = engine_kwargs.get("kv-events-config")
+        if kv_events_config and kv_events_config.get("enable_kv_cache_events", False):
+            base_port = int(os.environ.get("VERL_KV_EVENTS_BASE_PORT", "30000"))
+            step = int(os.environ.get("VERL_KV_EVENTS_PORT_STEP", "16"))
+            dp_size = self._get_kv_events_dp_size(engine_kwargs)
+            if step < 2 * dp_size:
+                raise ValueError(
+                    f"kv-events port step ({step}) < 2*data_parallel_size ({2 * dp_size}). "
+                    f"Each replica binds endpoint+replay, and vLLM offsets each by dp_rank "
+                    f"(0..{dp_size - 1}), so step must be >= 2*dp_size. "
+                    f"Set VERL_KV_EVENTS_PORT_STEP>={2 * dp_size}."
+                )
+            endpoints = []
+            assigned = []
+            for idx, (key, default) in enumerate([("endpoint", "tcp://*:5557"), ("replay_endpoint", "tcp://*:5558")]):
+                ep = kv_events_config.get(key, default)
+                if "tcp" in ep and ":" in ep:
+                    colon = ep.rfind(":")
+                    addr = ep[:colon]
+                    port = base_port + self.replica_rank * step + idx * dp_size
+                    try:
+                        self._check_kv_events_port(addr, port)
+                    except OSError as e:
+                        logger.error(
+                            f"kv-events port conflict: cannot bind {addr}:{port} for "
+                            f"replica_rank={self.replica_rank} ({key}). port = base_port("
+                            f"{base_port}) + replica_rank({self.replica_rank})*step({step}) "
+                            f"+ {idx}. Fix: (1) `ss -ltnp | grep :{port}` or `lsof -i :{port}`; "
+                            f"(2) raise VERL_KV_EVENTS_BASE_PORT (currently {base_port}); "
+                            f"(3) ensure replica_rank is unique per host; (4) if "
+                            f"data_parallel_size>1, set VERL_KV_EVENTS_PORT_STEP>={dp_size} "
+                            f"(currently {step}). Original error: {e}"
+                        )
+                        raise RuntimeError(
+                            f"kv-events {key} port {addr}:{port} already in use "
+                            f"(replica_rank={self.replica_rank}); adjust "
+                            f"VERL_KV_EVENTS_BASE_PORT / VERL_KV_EVENTS_PORT_STEP."
+                        ) from e
+                    kv_events_config[key] = f"{addr}:{port}"
+                    endpoints.append(f"{self._server_address}:{port}")
+                    assigned.append(f"{key}={addr}:{port}")
+            logger.info(
+                "kv-events ports assigned: replica_rank=%s base_port=%s step=%s dp_size=%s -> %s",
+                self.replica_rank,
+                base_port,
+                step,
+                dp_size,
+                ", ".join(assigned),
+            )
+            publisher = kv_events_config.get("publisher", "zmq")
+            topic = kv_events_config.get("topic", "kv-event")
+            endpoints.extend([publisher, topic])
+
+            self._kv_events_endpoints = endpoints
+
+    def _get_kv_events_dp_size(self, engine_kwargs: dict) -> int:
+        """Best-effort data_parallel_size for this replica (default 1; verl is dp=1)."""
+        for k in ("data-parallel-size", "data_parallel_size"):
+            v = engine_kwargs.get(k)
+            if v is not None:
+                try:
+                    return int(v)
+                except (TypeError, ValueError):
+                    logger.warning("kv-events: ignoring non-int %s=%r; defaulting dp_size to 1", k, v)
+                    return 1
+        return 1
+
+    def _check_kv_events_port(self, addr: str, port: int) -> None:
+        """Probe whether vLLM can bind `addr:port`; raise OSError on failure.
+
+        Diagnostics-only — the fixed scheme prevents cross-replica collisions; this
+        only catches externally occupied ports. Probes tcp://* as 0.0.0.0.
+        """
+        if "*" in addr:
+            probe_host = "0.0.0.0"
+        else:
+            probe_host = addr.replace("tcp://", "").strip("[]")
+        family = socket.AF_INET6 if is_valid_ipv6_address(probe_host) else socket.AF_INET
+        sock = socket.socket(family=family, type=socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind((probe_host, port))
+        finally:
+            sock.close()
 
     def _get_override_generation_config(self) -> dict:
         """Return the override_generation_config dict."""
