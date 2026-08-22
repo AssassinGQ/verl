@@ -46,6 +46,17 @@ class DataStore:
         self._metrics = PerReplicaStore.singleton()
         self._kv = KVCacheStore.singleton()
         self._per_request = PerRequestStore.singleton()
+        # Settle ACTIVE_SESSIONS when a binding row drops off the per-request
+        # LRU tail — without this the count leaks upward once the table fills.
+        # Idempotent by construction: the observer runs under the store lock and
+        # sees the row exactly once (it is being expelled).
+        self._per_request.on_row_evicted = self._on_row_evicted
+
+    def _on_row_evicted(self, request_id: str, row: dict[str, Any]) -> None:
+        """Eviction observer: drop the evicted row's sticky session count."""
+        replica_id = row.get(_STICKY_KEY)
+        if replica_id is not None:
+            self._metrics.incr(replica_id, MetricKey.ACTIVE_SESSIONS, -1)
 
     # ── PerReplicaStore operations ─────────────────────────────────────────
 
@@ -231,22 +242,52 @@ class DataStore:
         return self._metrics.incr_many(node_id, deltas)
 
     # ── Sticky bindings (a per-request value stored under _STICKY_KEY) ───
+    #
+    # The binding table is the single source of truth for session→replica
+    # (router request_id == gateway session_id). ACTIVE_SESSIONS is its
+    # per-replica live-count projection, maintained inside the three write
+    # paths below so no second ledger can drift from it:
+    #   put (new replica)         → +1 on the new replica
+    #   put (rebind: replica set) → -1 old, +1 new
+    #   invalidate / replica drop → -1
 
     def get_sticky_binding(self, request_id: str) -> str | None:
         """Return the bound replica_id for ``request_id`` (None if cold/evicted)."""
         return self._per_request.get(request_id, _STICKY_KEY)
 
     def put_sticky_binding(self, request_id: str, replica_id: str) -> None:
-        """Bind / refresh ``request_id → replica_id`` (driven by ``on_acquire``)."""
-        self._per_request.set(request_id, _STICKY_KEY, replica_id)
+        """Bind / refresh ``request_id → replica_id`` (driven by ``on_acquire``).
 
-    def invalidate_sticky_binding(self, request_id: str) -> None:
-        """Drop one request_id's sticky binding."""
+        First bind increments ACTIVE_SESSIONS on ``replica_id``; a rebind to a
+        different replica moves the count (-1 old, +1 new) — table replacement
+        semantics keep the gauge exact without a separate event stream.
+        """
+        previous = self._per_request.get(request_id, _STICKY_KEY)
+        self._per_request.set(request_id, _STICKY_KEY, replica_id)
+        if previous == replica_id:
+            return
+        if previous is not None:
+            self._metrics.incr(previous, MetricKey.ACTIVE_SESSIONS, -1)
+        self._metrics.incr(replica_id, MetricKey.ACTIVE_SESSIONS, 1)
+
+    def invalidate_sticky_binding(self, request_id: str) -> str | None:
+        """Drop one request_id's sticky binding (session end; idempotent).
+
+        Returns the replica_id the binding held (None when there was nothing
+        to drop) so callers can emit the post-drop ACTIVE_SESSIONS gauge.
+        """
+        previous = self._per_request.get(request_id, _STICKY_KEY)
+        if previous is None:
+            return None
         self._per_request.delete(request_id, _STICKY_KEY)
+        self._metrics.incr(previous, MetricKey.ACTIVE_SESSIONS, -1)
+        return previous
 
     def invalidate_sticky_replica(self, replica_id: str) -> None:
         """Drop every sticky binding pointing at a removed replica."""
-        self._per_request.delete_where(_STICKY_KEY, replica_id)
+        dropped = self._per_request.delete_where(_STICKY_KEY, replica_id)
+        if dropped:
+            self._metrics.incr(replica_id, MetricKey.ACTIVE_SESSIONS, -dropped)
 
     def sticky_status(self) -> dict:
         """Return a debugging snapshot of the sticky bindings."""

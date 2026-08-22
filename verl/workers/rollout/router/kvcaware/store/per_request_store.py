@@ -46,6 +46,12 @@ class PerRequestStore:
         self._max_size = int(max_size)
         self._lock = threading.Lock()
         self._data: LRUCache[str, dict[str, Any]] = LRUCache(maxsize=self._max_size)
+        # Eviction observer: called as ``fn(request_id, row)`` with the evicted
+        # row (dict of keys) under this store's lock — must be cheap and
+        # exception-free. Lets derived counters (ACTIVE_SESSIONS) settle when a
+        # binding row drops off the LRU tail, so the count never leaks. None by
+        # default; wired by DataStore.
+        self.on_row_evicted = None
         logger.info(f"PerRequestStore created: max_size={self._max_size}")
 
     @classmethod
@@ -71,7 +77,26 @@ class PerRequestStore:
         with self._lock:
             row = self._data.get(request_id, {})
             row[key] = value
-            self._data[request_id] = row  # insert (new) or touch LRU recency (existing)
+            self._insert(request_id, row)
+
+    def _insert(self, request_id: str, row: dict[str, Any]) -> None:
+        """Insert/touch a row, settling any LRU eviction via ``on_row_evicted``.
+
+        Caller must hold ``self._lock``. cachetools expels the tail row as a
+        side effect of ``__setitem__`` on a full cache; catching it keeps
+        derived counters (sticky ACTIVE_SESSIONS) from leaking upward.
+        """
+        if self.on_row_evicted is not None and len(self._data) >= self._data.maxsize:
+            evicted_id, evicted_row = next(iter(self._data.items()))
+            self._on_row_evicted_safe(evicted_id, evicted_row)
+        self._data[request_id] = row  # insert (new) or touch LRU recency (existing)
+
+    def _on_row_evicted_safe(self, request_id: str, row: dict[str, Any]) -> None:
+        """Invoke the eviction observer; observer errors are logged, never raised."""
+        try:
+            self.on_row_evicted(request_id, dict(row))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"on_row_evicted callback failed for {request_id}: {type(exc).__name__}: {exc}")
 
     def incr(self, request_id: str, key: str, delta: int | float = 1) -> int | float:
         """Add ``delta`` to ``request_id``'s numeric ``key``; return the new value."""
@@ -79,7 +104,7 @@ class PerRequestStore:
             row = self._data.get(request_id, {})
             value = row.get(key, 0) + delta
             row[key] = value
-            self._data[request_id] = row  # insert (new) or touch LRU recency (existing)
+            self._insert(request_id, row)
             return value
 
     def delete(self, request_id: str, key: str) -> None:
@@ -92,13 +117,20 @@ class PerRequestStore:
             if not row:
                 del self._data[request_id]
 
-    def delete_where(self, key: str, value: Any) -> None:
-        """Drop ``key`` from every request whose value for it equals ``value``."""
+    def delete_where(self, key: str, value: Any) -> int:
+        """Drop ``key`` from every request whose value for it equals ``value``.
+
+        Returns the number of dropped entries so callers can settle derived
+        counters (e.g. ACTIVE_SESSIONS on bulk replica invalidation).
+        """
         with self._lock:
+            dropped = 0
             for request_id, row in [(rid, r) for rid, r in self._data.items() if r.get(key) == value]:
                 row.pop(key, None)
                 if not row:
                     del self._data[request_id]
+                dropped += 1
+            return dropped
 
     def count(self, key: str) -> int:
         """Number of requests that currently have ``key`` set."""

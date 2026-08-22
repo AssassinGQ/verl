@@ -63,6 +63,16 @@ class LLMServerClient:
         self.config = config
         self._load_balancer = load_balancer_handle
 
+    @property
+    def router_handle(self):
+        """The shared router actor handle (kvcaware balancer or legacy LB).
+
+        Public read access for components that talk to the router directly
+        (e.g. the agent-framework bridge forwarding gateway session-end
+        notifications); ``generate()`` remains the LLM-request entry point.
+        """
+        return self._load_balancer
+
     async def _acquire_server(self, request_id: str, prompt_ids: list[int]) -> tuple[str, ray.actor.ActorHandle]:
         # Atomic acquire: returns (server_id, handle) in one Ray RPC.
         server_id, handle = await self._load_balancer.acquire_server.remote(
@@ -416,6 +426,16 @@ class LLMServerManager:
             servers=dict(zip(self.server_addresses, self.server_handles, strict=True)),
             rollout_config=self.rollout_config,
         )
+
+    @property
+    def router_handle(self):
+        """The shared router actor handle (kvcaware balancer or legacy LB).
+
+        Public read access for components that talk to the router directly
+        (e.g. the agent-framework adapter bridging gateway session-end
+        notifications); ``get_client`` remains the LLM-request entry point.
+        """
+        return self.global_load_balancer
 
     def get_client(self, client_cls=LLMServerClient, **kwargs) -> LLMServerClient:
         """Get the LLMServerClient to request LLM server replicas.

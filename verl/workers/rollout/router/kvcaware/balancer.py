@@ -75,6 +75,7 @@ class KVCAwareBalancer:
             "on_acquire": [],
             "on_release": [],
             "on_servers_removed": [],
+            "on_session_end": [],
         }
         self._store = DataStore()
         self._init_manager()
@@ -268,3 +269,17 @@ class KVCAwareBalancer:
             self._servers.pop(sid, None)
         if server_ids:
             self._fire("on_servers_removed", server_ids)
+
+    def on_session_end(self, session_id: str) -> None:
+        """Notify that a gateway session reached its terminal state.
+
+        Called fire-and-forget (Ray remote) by the rollout adapter when the
+        gateway manager finalizes or aborts a session. The router's request_id
+        IS the session_id, so dropping the sticky binding releases the
+        session's ACTIVE_SESSIONS count. Idempotent: an unknown / already-ended
+        session simply has no binding to drop. Fires ``on_session_end`` for
+        statistic collectors (currently none subscribed; reserved for skew /
+        overload observers).
+        """
+        self._store.invalidate_sticky_binding(session_id)
+        self._fire("on_session_end", session_id)

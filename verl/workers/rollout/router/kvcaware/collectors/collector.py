@@ -265,7 +265,17 @@ class Collector:
         if update.action == "put":
             self._data_store.put_sticky_binding(update.request_id, update.replica_id)
         elif update.action == "invalidate":
-            self._data_store.invalidate_sticky_binding(update.request_id)
+            replica = self._data_store.invalidate_sticky_binding(update.request_id)
+            if replica is not None and emitter.enabled():
+                emitter.on_write(
+                    WriteEvent(
+                        kind=WriteKind.SESSION_END,
+                        node=replica,
+                        new_values={
+                            MetricKey.ACTIVE_SESSIONS: self._data_store.get_metric(replica, MetricKey.ACTIVE_SESSIONS)
+                        },
+                    )
+                )
         elif update.action == "invalidate_replica":
             for rid in update.replica_ids:
                 self._data_store.invalidate_sticky_replica(rid)
@@ -292,9 +302,11 @@ class Collector:
             completed = snap.get(MetricKey.COMPLETED_COUNT, 0)
             inflight_turn_sum = snap.get(MetricKey.INFLIGHT_TURN_SUM, 0)
             prompt_len_sum = snap.get(MetricKey.PROMPT_LEN_SUM, 0)
+            active_sessions = snap.get(MetricKey.ACTIVE_SESSIONS, 0)
             logger.info(
                 f"router-dispatch replica={rep} dispatched={dispatched} completed={completed} "
-                f"inflight_turn_sum={inflight_turn_sum} prompt_len_sum={prompt_len_sum}"
+                f"inflight_turn_sum={inflight_turn_sum} prompt_len_sum={prompt_len_sum} "
+                f"active_sessions={active_sessions}"
             )
 
     def _log_evidence_window(self, node_id: str) -> None:

@@ -254,7 +254,13 @@ class KVCacheAwareStrategy:
                 if shortcut is not None:
                     return shortcut
             if self.slow_cut == SlowCut.LEAST_INFLIGHT:
-                return [-store.get_metric(r.replica_id, MetricKey.INFLIGHT_COUNT) for r in replicas]
+                # First-bind aware: sessions already bound to a replica stay
+                # lifted in ACTIVE_SESSIONS through their tool/sandbox phases
+                # (where INFLIGHT_COUNT momentarily reads 0), so the first
+                # request of a NEW session lands on the replica with the
+                # fewest live sessions instead of on whichever looks idle
+                # mid-tool-call.
+                return [-store.get_metric(r.replica_id, MetricKey.ACTIVE_SESSIONS) for r in replicas]
             # Hash-resolving slow_cuts share one resolution across all replicas.
             gpu_hash_strs = resolve_prefix_hashes(prompt_ids or [], request_id, store)
             if self.slow_cut == SlowCut.PREFIX_LOAD_AWARE:
@@ -366,8 +372,10 @@ class KVCacheAwareStrategy:
             remaining[i] = avail[i] - need[i]                    # free tokens after assign
             eligible[i]  = avail[i] >= cap × (1 - load_threshold)   # pure capacity gate
 
-        pick ``argmin(inflight_tokens)`` (least in-flight tokens wins) to keep
-        the first wave from collapsing onto ``pool[0]``.
+        pick ``argmin(active_sessions)`` (fewest live bound sessions wins) — the
+        session-count gauge stays lifted through tool/sandbox phases, so the
+        first wave spreads by true session load instead of by whatever looks
+        momentarily idle.
         Otherwise pick ``argmax(eligible, remaining)``.
         """
         n = len(replicas)
@@ -378,6 +386,7 @@ class KVCacheAwareStrategy:
             kv_perc = store.get_metric(replica.replica_id, MetricKey.KV_CACHE_USAGE_PERC) or 0.0
             inflight = store.get_metric(replica.replica_id, MetricKey.INFLIGHT_COUNT) or 0
             inflight_tokens = store.get_metric(replica.replica_id, MetricKey.INFLIGHT_TOKENS) or 0
+            active_sessions = store.get_metric(replica.replica_id, MetricKey.ACTIVE_SESSIONS) or 0
             s_cache, gpu_hit = self._cache_score(store, replica, gpu_hash_strs)
             avail = cap * (1.0 - kv_perc)
             need = plen * (1.0 - gpu_hit)
@@ -390,6 +399,7 @@ class KVCacheAwareStrategy:
                     "kv_perc": kv_perc,
                     "inflight": inflight,
                     "inflight_tokens": inflight_tokens,
+                    "active_sessions": active_sessions,
                     "gpu_hit": gpu_hit,
                     "s_cache": s_cache,
                     "avail": avail,
@@ -401,8 +411,8 @@ class KVCacheAwareStrategy:
         thresh = cap * (1.0 - self.load_threshold)
         cold_start = store.get_sticky_binding(request_id) is None
         if cold_start:
-            top = min(range(n), key=lambda i: rows[i]["inflight_tokens"])
-            logger.info("score(): CAPACITY_TOKEN_AWARE cold start → min inflight_tokens")
+            top = min(range(n), key=lambda i: rows[i]["active_sessions"])
+            logger.info("score(): CAPACITY_TOKEN_AWARE cold start → min active_sessions")
         else:
             eligible = [i for i in range(n) if rows[i]["avail"] >= thresh]
             if not eligible:
@@ -418,6 +428,7 @@ class KVCacheAwareStrategy:
                 f"gpu_hit={row['gpu_hit']:.3f} inflight={row['inflight']} "
                 f"avail={row['avail']:.0f} need={row['need']:.0f} "
                 f"max_num_batched_tokens={self._max_num_batched_tokens} inflight_tokens={row['inflight_tokens']:} "
+                f"active_sessions={row['active_sessions']} "
                 f"remaining={row['remaining']:.0f}{tag}"
             )
         winner = rows[top]["replica"].replica_id

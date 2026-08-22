@@ -54,6 +54,7 @@ class WriteKind:
     ACQUIRE = "acquire"  # request dispatched (incr_metrics on acquire)
     RELEASE = "release"  # request completed (incr_metrics on release)
     KV_REMOVED = "kv_removed"  # KV blocks removed (remove_kv_blocks)
+    SESSION_END = "session_end"  # gateway session finalized/aborted (binding invalidate)
 
 
 # B-class gauge primitives read from a poll event's ``new_values`` (the 3 vLLM
@@ -195,13 +196,17 @@ class Emitter:
             self._emit_from(event.deltas, EmitKey.DISPATCHED_COUNT, replica)
             self._emit_from(event.deltas, EmitKey.PROMPT_LEN_SUM, replica)
             self._emit_from(event.new_values, EmitKey.INFLIGHT_TOKENS, replica)
+            self._emit_from(event.new_values, EmitKey.ACTIVE_SESSIONS, replica)
             self._emit_avg_turn(replica, event)
         elif kind == WriteKind.RELEASE:
             self._emit_from(event.deltas, EmitKey.COMPLETED_COUNT, replica)
             self._emit_from(event.new_values, EmitKey.INFLIGHT_TOKENS, replica)
+            self._emit_from(event.new_values, EmitKey.ACTIVE_SESSIONS, replica)
             self._emit_avg_turn(replica, event)
         elif kind == WriteKind.KV_REMOVED:
             self._emit_from(event.deltas, EmitKey.KV_EVICTIONS, replica)
+        elif kind == WriteKind.SESSION_END:
+            self._emit_from(event.new_values, EmitKey.ACTIVE_SESSIONS, replica)
 
     def _emit_from(self, src: dict[str, float], key: str, replica: str) -> None:
         """Emit ``key`` from ``src`` (counter deltas or gauge absolutes) if present."""

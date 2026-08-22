@@ -62,6 +62,7 @@ class EmitKey:
     PROMPT_LEN_SUM: str = "prompt_len_sum"
     INFLIGHT_AVG_TURN: str = "inflight_avg_turn"
     KV_EVICTIONS: str = "kv_evictions"
+    ACTIVE_SESSIONS: str = "active_sessions"
     # ── A-class · strategy on_score / on_route (6) ──
     LOAD: str = "load"
     S_CACHE: str = "s_cache"
@@ -191,6 +192,11 @@ EMIT_SPECS: dict[str, dict[str, Any]] = {
             "Cumulative KV block removals (vLLM removed events; not pure evictions "
             "— includes request-completion releases)"
         ),
+    },
+    EmitKey.ACTIVE_SESSIONS: {
+        "type": "gauge",
+        "labels": ["replica"],
+        "help": "Live sessions bound per replica (sticky binding count; session-end -1)",
     },
     # ── A-class histogram · strategy components (per-dispatch × per-replica observe) ──
     EmitKey.LOAD: {

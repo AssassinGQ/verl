@@ -88,6 +88,13 @@ class MetricKey:
     # replica's PROMPT_LEN_SUM. Windowed avg prompt len = Δsum / Δdispatched — the
     # request-size signal the router sees at dispatch time (pre-engine).
     PROMPT_LEN_SUM: str = "prompt_len_sum"
+    # Live sessions bound to each replica — derived from the sticky binding table
+    # (request_id == session_id): +1 on first bind, moved on rebind, -1 on
+    # session end (gateway finalize/abort) or binding eviction. Unlike
+    # INFLIGHT_COUNT (instantaneous LLM requests; zero while a session is in its
+    # tool/sandbox phase), this gauge stays lifted for the session's whole
+    # lifetime — the first-bind signal agentic rollout actually needs.
+    ACTIVE_SESSIONS: str = "active_sessions"
 
 
 # ── Metric definitions (single source of truth) ──────────────────────
@@ -210,5 +217,10 @@ METRIC_SPECS: dict[str, dict[str, Any]] = {
         "default": 0,
         "value_type": int,
         "describe": "Cumul. sum of dispatched prompt lengths, per replica (avg len = Δsum/Δdispatched)",
+    },
+    MetricKey.ACTIVE_SESSIONS: {
+        "default": 0,
+        "value_type": int,
+        "describe": "Live sessions bound per replica (sticky binding count; session-end -1)",
     },
 }
