@@ -61,4 +61,9 @@ plan 已更新：task_plan P1 方案 + Phase 1 产出描述 + D2 改写（原"�
 
 测试：strategy 119 + balancer 41 + ray-integration 5 + config/router 108 全绿；quota（P2 可选项）未实现——窗口+加权已覆盖其目标，等 Phase 6 回放显示需要再加。既有 flaky：balancer 目录混跑时 ray-integration 5 例失败系 conftest session 级 monkeypatch 的条件判断粒度问题（P1 前即存在，单跑/文件级跑均过），未修。
 
+### 2026/08/23 — 全部提交推送
+
+- verl4 `router-dev` → `origin/router-dev`：`0bd3ea8f`(P1) / `87faf46a`(P2) / `c875d1f7`(P3) / `e93e049b`(P4) / `29ec0085`(P5) / `d4147d54`(docs) 全部推送。
+- uni-agent `router` → `origin/router`：P1 桥接 commit `1cbdab0` 已在远端（用户后续提交 `0618505`/`f54f14e` 叠于其上）。
+
 下一步：Phase 6 日志回放（exp1 32K 日志 + `/tmp/reconcile.py` 思路正式化），校准 window/Δ/factor/ε。
