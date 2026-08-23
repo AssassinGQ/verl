@@ -24,6 +24,9 @@ strategies:
     # sticky_overload_threshold: 0.3   # unbind when the bound replica is this hot
     # capacity_reserve_threshold: 0.9  # replica joins capacity ranking only if
     #                                  # avail >= cap × (1 - this)
+    # P5: capacity top-set width — replicas within cap × tie_epsilon of the best
+    # remaining are drawn uniformly (0 = strict argmax).
+    tie_epsilon: 0.01
     layer_weights:
       gpu: 0.7
       cpu: 0.2

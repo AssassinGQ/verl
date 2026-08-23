@@ -65,6 +65,7 @@ class KVCacheAwareStrategy:
         skew_window: int = 60,
         skew_delta: int = 2,
         skew_factor: float = 2.0,
+        tie_epsilon: float = 0.01,
     ) -> None:
         if not 0 <= alpha <= 1:
             raise StrategyError(f"alpha must be in [0, 1], got {alpha}")
@@ -113,6 +114,8 @@ class KVCacheAwareStrategy:
             raise StrategyError(f"skew_delta must be a non-negative int, got {skew_delta!r}")
         if not isinstance(skew_factor, int | float) or skew_factor <= 1.0:
             raise StrategyError(f"skew_factor must be > 1.0, got {skew_factor!r}")
+        if not isinstance(tie_epsilon, int | float) or tie_epsilon < 0:
+            raise StrategyError(f"tie_epsilon must be a non-negative number, got {tie_epsilon!r}")
 
         self.alpha = float(alpha)
         self.load_threshold = float(load_threshold)
@@ -136,6 +139,7 @@ class KVCacheAwareStrategy:
         self.skew_window = skew_window
         self.skew_delta = skew_delta
         self.skew_factor = float(skew_factor)
+        self.tie_epsilon = float(tie_epsilon)
         # SKEW streak counter per replica (see _is_skew_overloaded) — the only
         # mutable state in the strategy; the router actor is single-threaded so
         # no lock is needed.
@@ -150,7 +154,8 @@ class KVCacheAwareStrategy:
             f"first_bind_window={self.first_bind_window}, first_bind_weighted={self.first_bind_weighted}, "
             f"sticky_overload_threshold={self.sticky_overload_threshold:.2f}, "
             f"capacity_reserve_threshold={self.capacity_reserve_threshold:.2f}, "
-            f"skew=(window={self.skew_window}, delta={self.skew_delta}, factor={self.skew_factor})"
+            f"skew=(window={self.skew_window}, delta={self.skew_delta}, factor={self.skew_factor}), "
+            f"tie_epsilon={self.tie_epsilon}"
         )
 
     def set_capacity(self, max_num_seqs: int, max_num_batched_tokens: int) -> None:
@@ -187,7 +192,34 @@ class KVCacheAwareStrategy:
             skew_window=cfg.skew_window,
             skew_delta=cfg.skew_delta,
             skew_factor=cfg.skew_factor,
+            tie_epsilon=cfg.tie_epsilon,
         )
+
+    def _near_top_pick(self, cap: float, rows: list[dict], pool: list[int], tag: str) -> int:
+        """Pick the capacity-branch winner: near-top set + uniform random (P5).
+
+        ``remaining`` is a continuous float, so exact-equality ties essentially
+        never occur (exp2: 75 across 40,292 routes, all during the cold-start
+        15s) — a strict argmax is deterministic in practice and its feedback
+        (argmax → fills → lower remaining → argmax elsewhere) concentrates
+        traffic. The top set is widened to every ``pool`` replica within
+        ``cap × tie_epsilon`` of the best remaining; the winner is drawn
+        uniformly from that set. epsilon=0 reduces to strict argmax.
+        """
+        if not pool:
+            raise StrategyError("near-top pick requires a non-empty pool")
+        best = max(rows[i]["remaining"] for i in pool)
+        eps = cap * self.tie_epsilon
+        if eps > 0:
+            top_set = [i for i in pool if rows[i]["remaining"] >= best - eps]
+        else:
+            top_set = [max(pool, key=lambda i: rows[i]["remaining"])]
+        pick = random.choice(top_set) if len(top_set) > 1 else top_set[0]
+        logger.info(
+            f"score(): CAPACITY_TOKEN_AWARE {tag} near-top set={len(top_set)} "
+            f"(eps={eps:.0f}, best={best:.0f}) → winner idx={pick}"
+        )
+        return pick
 
     def _first_bind_top(self, counts: list[int]) -> int:
         """Pick the first-bind winner index from per-replica session counts.
@@ -518,7 +550,11 @@ class KVCacheAwareStrategy:
         idle; co-tied replicas (within ``first_bind_window`` of the min) are
         resolved by weighted random rather than pool order (see
         :meth:`_first_bind_top`).
-        Otherwise pick ``argmax(eligible, remaining)``.
+        Otherwise pick ``argmax(eligible, remaining)`` widened by
+        ``tie_epsilon``: every eligible replica within ``cap × epsilon`` of
+        the best remaining joins the top set, drawn uniformly at random (see
+        :meth:`_near_top_pick`); the all-overloaded fallback applies the same
+        treatment to the full pool.
         """
         n = len(replicas)
         cap = self._total_token_capacity(store)
@@ -562,10 +598,9 @@ class KVCacheAwareStrategy:
         else:
             eligible = [i for i in range(n) if rows[i]["avail"] >= thresh]
             if not eligible:
-                top = max(range(n), key=lambda i: rows[i]["remaining"])
-                logger.info("score(): CAPACITY_TOKEN_AWARE no eligible → max remaining")
+                top = self._near_top_pick(cap, rows, list(range(n)), tag="no-eligible")
             else:
-                top = max(eligible, key=lambda i: rows[i]["remaining"])
+                top = self._near_top_pick(cap, rows, eligible, tag="eligible")
 
         for i, row in enumerate(rows):
             tag = " ← WINNER" if i == top else ""

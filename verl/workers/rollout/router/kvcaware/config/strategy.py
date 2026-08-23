@@ -57,6 +57,14 @@ class KVCAwareStrategyConfig(StrategyConfig):
     # running AND inflight_tokens both > skew_factor × pool median counts as
     # skewed (ratio form for the large-range signals).
     skew_factor: float = 2.0
+    # ── Near-top random (P5; capacity branch tie handling) ──
+    # ``remaining`` is a continuous float, so exact-equality ties are ~never
+    # (exp2: 75 in 40,292 routes, all in the cold-start 15s). The top set is
+    # widened to every replica within cap × tie_epsilon of the best remaining,
+    # then chosen uniformly at random — smoothing the deterministic argmax's
+    # feedback (argmax → fills → lower remaining → argmax elsewhere) without
+    # meaningfully sacrificing per-request optimality. 0 = strict argmax.
+    tie_epsilon: float = 0.01
     layer_weights: dict[Layer, float] = field(default_factory=lambda: {Layer.GPU: 0.7, Layer.CPU: 0.2, Layer.SSD: 0.1})
     # Sticky short-circuit: when True, a returning session is sent back to its
     # bound replica only if that replica is NOT overloaded (load > load_threshold).
@@ -96,6 +104,8 @@ class KVCAwareStrategyConfig(StrategyConfig):
             raise ConfigError(f"skew_delta must be a non-negative int, got {self.skew_delta!r}")
         if not isinstance(self.skew_factor, int | float) or self.skew_factor <= 1.0:
             raise ConfigError(f"skew_factor must be > 1.0, got {self.skew_factor!r}")
+        if not isinstance(self.tie_epsilon, int | float) or self.tie_epsilon < 0:
+            raise ConfigError(f"tie_epsilon must be a non-negative number, got {self.tie_epsilon!r}")
         if not isinstance(self.memory_overload_filter, bool):
             raise ConfigError(f"memory_overload_filter must be a bool, got {self.memory_overload_filter!r}")
         if not isinstance(self.do_shortcut, bool):
