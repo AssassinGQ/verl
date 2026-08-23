@@ -42,3 +42,12 @@ plan 已更新：task_plan P1 方案 + Phase 1 产出描述 + D2 改写（原"�
 据此 P1 改为（D5）：ACTIVE_SESSIONS 由 binding put/替换/invalidate 同步 ±1（单一事实源派生，无第二账本）；uni-agent 侧 GatewayManager 加通用终态回调（默认空），`framework/entry.py` 桥接 fire-and-forget `balancer.on_session_end.remote(session_id)`。原 SessionTransport/SessionDecoder 链与超时近似 fallback 均作废。
 
 另发现 `../uni-agent/uni_agent/llm_router/` 为 kvcaware 迁移副本（测试中，用户明确不动，D6）；P1 的 uni-agent 侧改动仅 `gateway/manager.py` + `framework/entry.py`。应用户要求，task_plan 开头新增"§0 架构原则"五条（单一事实源 / 进程边界 / 事件链最少化 / 迁移兼容 / 幂等降级）+ 各 P 扩展性落点。
+
+### 2026/08/22 — P1 落地完成（两个 commit）
+
+**verl4 `0bd3ea8f`**：store（binding 写路径维护 ACTIVE_SESSIONS、delete_where 返回删除数、LRU on_row_evicted 钩子）、balancer（`on_session_end` Ray 方法 + `_fire` 钩子）、strategy（least-inflight 与 capacity 冷启动改 `min(active_sessions)`）、llm_server（`router_handle` 属性）、insight（METRIC/EMIT_SPECS + ACQUIRE/RELEASE/SESSION_END 三写点发射、router-dispatch 行）、测试（store 生命周期 9 例 + balancer 5 例全绿）。
+**uni-agent `1cbdab0`**：GatewayManager 终态回调（默认空、异常吞掉）+ `bridge_session_end_to_router`（entry.py adapter 与 llm_router example 两处接线）+ gateway 回调测试 4 例。
+
+测试结果：router 全套 326 passed / 7 skipped；e2e 2 例失败为**既有环境问题**（venv 缺 `uni_agent` 模块、缺 `mooncake_http_metadata_server` 二进制，stash 基线同样失败）；strategy 4 例既有失败（测试未传 request_id 被 cold-start 分支截胡）按其本意改用 `sticky={"r1": "rep_gone"}` 钉住 eligible 排序路径后全绿。metric.md/strategy.md 已同步新语义。
+
+下一步：P2（首绑加权随机/quota）。

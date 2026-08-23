@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import random
 import time
 from typing import TYPE_CHECKING
 
@@ -57,6 +58,8 @@ class KVCacheAwareStrategy:
         slow_cut: SlowCut | str = SlowCut.PREFIX_LOAD_AWARE,
         load_weights: tuple[float, float, float, float] = DEFAULT_LOAD_WEIGHTS,
         overload_mode: OverloadMode | str = OverloadMode.KV_LOAD,
+        first_bind_window: int = 1,
+        first_bind_weighted: bool = True,
     ) -> None:
         if not 0 <= alpha <= 1:
             raise StrategyError(f"alpha must be in [0, 1], got {alpha}")
@@ -89,6 +92,10 @@ class KVCacheAwareStrategy:
             raise StrategyError(f"load_weights must be 4 non-negative values, got {load_weights}")
         if abs(sum(load_weights) - 1.0) > 1e-6:
             raise StrategyError(f"load_weights must sum to 1.0, got {sum(load_weights)}")
+        if not isinstance(first_bind_window, int) or first_bind_window < 0:
+            raise StrategyError(f"first_bind_window must be a non-negative int, got {first_bind_window!r}")
+        if not isinstance(first_bind_weighted, bool):
+            raise StrategyError(f"first_bind_weighted must be a bool, got {first_bind_weighted!r}")
 
         self.alpha = float(alpha)
         self.load_threshold = float(load_threshold)
@@ -100,13 +107,16 @@ class KVCacheAwareStrategy:
         self.slow_cut = slow_cut
         self.load_weights = tuple(load_weights)
         self.overload_mode = overload_mode
+        self.first_bind_window = first_bind_window
+        self.first_bind_weighted = first_bind_weighted
         self._max_num_seqs: int | None = None
         self._max_num_batched_tokens: int | None = None
         logger.info(
             f"KVCacheAwareStrategy created: alpha={self.alpha:.2f}, "
             f"load_threshold={self.load_threshold:.2f}, load_weights={self.load_weights}, "
             f"memory_overload_filter={self.memory_overload_filter}, do_shortcut={self.do_shortcut}, "
-            f"slow_cut={self.slow_cut.value}, overload_mode={self.overload_mode.value}"
+            f"slow_cut={self.slow_cut.value}, overload_mode={self.overload_mode.value}, "
+            f"first_bind_window={self.first_bind_window}, first_bind_weighted={self.first_bind_weighted}"
         )
 
     def set_capacity(self, max_num_seqs: int, max_num_batched_tokens: int) -> None:
@@ -136,7 +146,34 @@ class KVCacheAwareStrategy:
             do_shortcut=cfg.do_shortcut,
             slow_cut=cfg.slow_cut,
             overload_mode=cfg.overload_mode,
+            first_bind_window=cfg.first_bind_window,
+            first_bind_weighted=cfg.first_bind_weighted,
         )
+
+    def _first_bind_top(self, counts: list[int]) -> int:
+        """Pick the first-bind winner index from per-replica session counts.
+
+        Candidate window = every replica within ``first_bind_window`` sessions
+        of the minimum (0 = strict min, reproducing the pre-P2 behavior minus
+        its iteration-order bias). Inside the window: weighted random — weight
+        ``window + 1 − count`` tilts toward the emptier replicas while keeping
+        co-tied ones reachable; ``first_bind_weighted=False`` flattens to
+        uniform. Determinism note: the router actor is single-threaded, so a
+        seeded ``random`` module state makes runs reproducible; unseeded runs
+        randomize — the point of P2 (small-integer ties should not resolve by
+        pool order).
+        """
+        lo = min(counts)
+        window = self.first_bind_window
+        if window <= 0:
+            return min(range(len(counts)), key=lambda i: counts[i])
+        candidates = [i for i, c in enumerate(counts) if c <= lo + window]
+        if len(candidates) == 1:
+            return candidates[0]
+        if self.first_bind_weighted:
+            weights = [lo + window + 1 - counts[i] for i in candidates]
+            return random.choices(candidates, weights=weights, k=1)[0]
+        return random.choice(candidates)
 
     def _compute_load(
         self,
@@ -259,8 +296,13 @@ class KVCacheAwareStrategy:
                 # (where INFLIGHT_COUNT momentarily reads 0), so the first
                 # request of a NEW session lands on the replica with the
                 # fewest live sessions instead of on whichever looks idle
-                # mid-tool-call.
-                return [-store.get_metric(r.replica_id, MetricKey.ACTIVE_SESSIONS) for r in replicas]
+                # mid-tool-call. Small-integer ties are the norm here — resolve
+                # them by windowed random (P2), not pool iteration order.
+                counts = [store.get_metric(r.replica_id, MetricKey.ACTIVE_SESSIONS) or 0 for r in replicas]
+                top = self._first_bind_top(counts)
+                scores = [0.0] * len(replicas)
+                scores[top] = STICKY_TOP_SCORE
+                return scores
             # Hash-resolving slow_cuts share one resolution across all replicas.
             gpu_hash_strs = resolve_prefix_hashes(prompt_ids or [], request_id, store)
             if self.slow_cut == SlowCut.PREFIX_LOAD_AWARE:
@@ -372,10 +414,12 @@ class KVCacheAwareStrategy:
             remaining[i] = avail[i] - need[i]                    # free tokens after assign
             eligible[i]  = avail[i] >= cap × (1 - load_threshold)   # pure capacity gate
 
-        pick ``argmin(active_sessions)`` (fewest live bound sessions wins) — the
-        session-count gauge stays lifted through tool/sandbox phases, so the
-        first wave spreads by true session load instead of by whatever looks
-        momentarily idle.
+        pick ``argmin(active_sessions)`` with a tie window — the session-count
+        gauge stays lifted through tool/sandbox phases, so the first wave
+        spreads by true session load instead of by whatever looks momentarily
+        idle; co-tied replicas (within ``first_bind_window`` of the min) are
+        resolved by weighted random rather than pool order (see
+        :meth:`_first_bind_top`).
         Otherwise pick ``argmax(eligible, remaining)``.
         """
         n = len(replicas)
@@ -411,8 +455,12 @@ class KVCacheAwareStrategy:
         thresh = cap * (1.0 - self.load_threshold)
         cold_start = store.get_sticky_binding(request_id) is None
         if cold_start:
-            top = min(range(n), key=lambda i: rows[i]["active_sessions"])
-            logger.info("score(): CAPACITY_TOKEN_AWARE cold start → min active_sessions")
+            top = self._first_bind_top([rows[i]["active_sessions"] for i in range(n)])
+            logger.info(
+                "score(): CAPACITY_TOKEN_AWARE cold start → windowed first-bind "
+                f"(window={self.first_bind_window}, weighted={self.first_bind_weighted}) "
+                f"active_sessions={[rows[i]['active_sessions'] for i in range(n)]}"
+            )
         else:
             eligible = [i for i in range(n) if rows[i]["avail"] >= thresh]
             if not eligible:

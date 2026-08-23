@@ -47,6 +47,18 @@ class KVCAwareStrategyConfig(StrategyConfig):
     # ``simple`` = kv_cache_usage_perc > load_threshold; ``blended`` = the
     # original weighted load formula. Default ``blended`` preserves behavior.
     overload_mode: OverloadMode = OverloadMode.KV_LOAD
+    # ── First-bind tie handling ──
+    # Agentic first binds read small-integer counters (active_sessions), so
+    # ties are the norm, not the exception. A deterministic min() then makes
+    # the landing spot a function of pool iteration order — the same replica
+    # keeps absorbing co-tied new sessions.
+    # Candidate window: replicas within ``first_bind_window`` sessions of the
+    # minimum are all considered tied. 0 reproduces strict-min behavior.
+    first_bind_window: int = 1
+    # Weighted random choice within the window (weight = window+1-count per
+    # replica, favoring the emptier end). False = uniform random; both are
+    # overrides for strict-min, which landed sessions by iteration order.
+    first_bind_weighted: bool = True
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -56,6 +68,10 @@ class KVCAwareStrategyConfig(StrategyConfig):
             raise ConfigError(f"memory_overload_filter must be a bool, got {self.memory_overload_filter!r}")
         if not isinstance(self.do_shortcut, bool):
             raise ConfigError(f"do_shortcut must be a bool, got {self.do_shortcut!r}")
+        if not isinstance(self.first_bind_window, int) or self.first_bind_window < 0:
+            raise ConfigError(f"first_bind_window must be a non-negative int, got {self.first_bind_window!r}")
+        if not isinstance(self.first_bind_weighted, bool):
+            raise ConfigError(f"first_bind_weighted must be a bool, got {self.first_bind_weighted!r}")
         # Normalize yaml str → SlowCut (also validates the value is a known mode).
         try:
             self.slow_cut = SlowCut(self.slow_cut)

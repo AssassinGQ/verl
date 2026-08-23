@@ -41,7 +41,7 @@
 | # | 阶段 | 状态 | 产出 |
 |---|---|---|---|
 | 0 | 现有代码结构确认 + 信号可得性核对 | ⏳ pending | 确认 acquire/release 回调链能挂 session 生命周期钩子；确认 store 能维护 per-replica active_sessions；列出每项改动的触点文件清单 |
-| 1 | P1 `active_sessions` 信号 + 首绑 | 🔄 in progress | binding 派生：ACTIVE_SESSIONS 由 sticky binding put/替换/invalidate 同步维护；GatewayManager 终态回调（默认空）→ entry.py 桥接 → balancer `on_session_end`（invalidate + _fire）；首绑分支读 min(ACTIVE_SESSIONS)；METRIC_SPECS/EMIT_SPECS 各 +1；单测 |
+| 1 | P1 `active_sessions` 信号 + 首绑 | ✅ done (verl `0bd3ea8f` + uni-agent `1cbdab0`) | binding 派生：ACTIVE_SESSIONS 由 sticky binding put/替换/invalidate 同步维护；GatewayManager 终态回调（默认空）→ entry.py 桥接 → balancer `on_session_end`（invalidate + _fire）；首绑分支读 min(ACTIVE_SESSIONS)；METRIC_SPECS/EMIT_SPECS 各 +1；单测 |
 | 2 | P2 首绑加权随机 / quota | ⏳ pending | 候选集 = 计数最低 ± 窗口；窗口内均匀或按 (max−count+1) 加权；quota 上限可选；单测 |
 | 3 | P3 阈值双语义拆分 | ⏳ pending | config 新增 `sticky_overload_threshold` / `capacity_reserve_threshold`，`load_threshold` 保留向后兼容；capacity 分支与 overload 判据分开读各自阈值；单测 + config 兼容测试 |
 | 4 | P4 overload 组合信号（持续偏斜） | ⏳ pending | 新增 `OverloadMode.SKEW`（或类似）：sustained(active_sessions>median+Δ 或 running>2×median 且 inflight_tokens>2×median，窗口 60s)；仅作用于 sticky shortcut 的 fallback 判定；单测 |
