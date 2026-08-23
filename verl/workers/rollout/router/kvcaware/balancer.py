@@ -90,7 +90,13 @@ class KVCAwareBalancer:
         cfg = strategies[0]
         name = type(cfg).__name__
         bits = []
-        for k in ("alpha", "load_threshold", "memory_overload_filter"):
+        for k in (
+            "alpha",
+            "load_threshold",
+            "sticky_overload_threshold",
+            "capacity_reserve_threshold",
+            "memory_overload_filter",
+        ):
             if hasattr(cfg, k):
                 bits.append(f"{k}={getattr(cfg, k)}")
         if hasattr(cfg, "slow_cut"):

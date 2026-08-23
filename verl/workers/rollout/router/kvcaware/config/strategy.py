@@ -35,6 +35,15 @@ class KVCAwareStrategyConfig(StrategyConfig):
 
     alpha: float = 0.7
     load_threshold: float = 0.9
+    # ── Threshold semantics split (P3) ──
+    # load_threshold historically controls TWO unrelated decisions:
+    #   1. sticky overload trigger (kv_perc > threshold → drop binding)
+    #   2. capacity eligibility gate (avail >= cap × (1-threshold))
+    # One knob can't serve both: at 0.9 the overload channel never fires (exp1
+    # peak KV usage 0.22), while the reserve semantics want ~0.9. Defaults
+    # None → fall back to load_threshold (exact legacy behavior).
+    sticky_overload_threshold: float | None = None
+    capacity_reserve_threshold: float | None = None
     layer_weights: dict[Layer, float] = field(default_factory=lambda: {Layer.GPU: 0.7, Layer.CPU: 0.2, Layer.SSD: 0.1})
     # Sticky short-circuit: when True, a returning session is sent back to its
     # bound replica only if that replica is NOT overloaded (load > load_threshold).
@@ -64,6 +73,10 @@ class KVCAwareStrategyConfig(StrategyConfig):
         super().__post_init__()
         if not 0 < self.load_threshold < 1:
             raise ConfigError(f"load_threshold must be in (0, 1), got {self.load_threshold}")
+        for name in ("sticky_overload_threshold", "capacity_reserve_threshold"):
+            value = getattr(self, name)
+            if value is not None and not 0 < value < 1:
+                raise ConfigError(f"{name} must be in (0, 1) or None, got {value}")
         if not isinstance(self.memory_overload_filter, bool):
             raise ConfigError(f"memory_overload_filter must be a bool, got {self.memory_overload_filter!r}")
         if not isinstance(self.do_shortcut, bool):

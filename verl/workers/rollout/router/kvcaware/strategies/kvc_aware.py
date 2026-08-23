@@ -60,6 +60,8 @@ class KVCacheAwareStrategy:
         overload_mode: OverloadMode | str = OverloadMode.KV_LOAD,
         first_bind_window: int = 1,
         first_bind_weighted: bool = True,
+        sticky_overload_threshold: float | None = None,
+        capacity_reserve_threshold: float | None = None,
     ) -> None:
         if not 0 <= alpha <= 1:
             raise StrategyError(f"alpha must be in [0, 1], got {alpha}")
@@ -96,6 +98,12 @@ class KVCacheAwareStrategy:
             raise StrategyError(f"first_bind_window must be a non-negative int, got {first_bind_window!r}")
         if not isinstance(first_bind_weighted, bool):
             raise StrategyError(f"first_bind_weighted must be a bool, got {first_bind_weighted!r}")
+        for name, value in (
+            ("sticky_overload_threshold", sticky_overload_threshold),
+            ("capacity_reserve_threshold", capacity_reserve_threshold),
+        ):
+            if value is not None and not 0 < value < 1:
+                raise StrategyError(f"{name} must be in (0, 1) or None, got {value}")
 
         self.alpha = float(alpha)
         self.load_threshold = float(load_threshold)
@@ -109,6 +117,13 @@ class KVCacheAwareStrategy:
         self.overload_mode = overload_mode
         self.first_bind_window = first_bind_window
         self.first_bind_weighted = first_bind_weighted
+        # Resolved thresholds: explicit override or the legacy shared knob.
+        self.sticky_overload_threshold = (
+            float(sticky_overload_threshold) if sticky_overload_threshold is not None else float(load_threshold)
+        )
+        self.capacity_reserve_threshold = (
+            float(capacity_reserve_threshold) if capacity_reserve_threshold is not None else float(load_threshold)
+        )
         self._max_num_seqs: int | None = None
         self._max_num_batched_tokens: int | None = None
         logger.info(
@@ -116,7 +131,9 @@ class KVCacheAwareStrategy:
             f"load_threshold={self.load_threshold:.2f}, load_weights={self.load_weights}, "
             f"memory_overload_filter={self.memory_overload_filter}, do_shortcut={self.do_shortcut}, "
             f"slow_cut={self.slow_cut.value}, overload_mode={self.overload_mode.value}, "
-            f"first_bind_window={self.first_bind_window}, first_bind_weighted={self.first_bind_weighted}"
+            f"first_bind_window={self.first_bind_window}, first_bind_weighted={self.first_bind_weighted}, "
+            f"sticky_overload_threshold={self.sticky_overload_threshold:.2f}, "
+            f"capacity_reserve_threshold={self.capacity_reserve_threshold:.2f}"
         )
 
     def set_capacity(self, max_num_seqs: int, max_num_batched_tokens: int) -> None:
@@ -148,6 +165,8 @@ class KVCacheAwareStrategy:
             overload_mode=cfg.overload_mode,
             first_bind_window=cfg.first_bind_window,
             first_bind_weighted=cfg.first_bind_weighted,
+            sticky_overload_threshold=cfg.sticky_overload_threshold,
+            capacity_reserve_threshold=cfg.capacity_reserve_threshold,
         )
 
     def _first_bind_top(self, counts: list[int]) -> int:
@@ -207,7 +226,7 @@ class KVCacheAwareStrategy:
         store: DataStore,
         replica: ReplicaInfo,
     ) -> bool:
-        """Return True if ``replica`` is overloaded (``load > load_threshold``).
+        """Return True if ``replica`` is overloaded (``load > sticky_overload_threshold``).
 
         Used only by the sticky short-circuit to decide whether to send a
         returning session back to its bound replica. Combined scoring never
@@ -218,7 +237,7 @@ class KVCacheAwareStrategy:
         if self.overload_mode == OverloadMode.KV_CACHE_USAGE_PERC:
             kv_perc = store.get_metric(replica.replica_id, MetricKey.KV_CACHE_USAGE_PERC) or 0.0
             logger.info(f"is-overload replica={replica.replica_id} kv_perc={kv_perc:.4f}")
-            return kv_perc > self.load_threshold
+            return kv_perc > self.sticky_overload_threshold
         if self.overload_mode == OverloadMode.KV_LOAD:
             m = store.get_metrics(replica.replica_id)
             kv_usage = store.kv_cache_load(replica.replica_id)
@@ -228,7 +247,7 @@ class KVCacheAwareStrategy:
             load = self._compute_load(kv_usage, running, waiting, inflight)
             # Emit the load the sticky check used (the bound replica).
             logger.info(f"is-overload replica={replica.replica_id} kv_load={load:.4f}")
-            return load > self.load_threshold
+            return load > self.sticky_overload_threshold
         raise ValueError(
             f"There is no {self.overload_mode}, please set overload_mode in ['None', 'kv_cache_usage_perc', 'kv_load']"
         )
@@ -412,7 +431,7 @@ class KVCacheAwareStrategy:
             avail[i]     = cap × (1 - kv_cache_usage_perc[i])   # free tokens (no cache)
             need[i]      = len(prompt_ids) × (1 - gpu_hit[i])    # prefill this req adds
             remaining[i] = avail[i] - need[i]                    # free tokens after assign
-            eligible[i]  = avail[i] >= cap × (1 - load_threshold)   # pure capacity gate
+            eligible[i]  = avail[i] >= cap × (1 - capacity_reserve_threshold)   # pure capacity gate
 
         pick ``argmin(active_sessions)`` with a tie window — the session-count
         gauge stays lifted through tool/sandbox phases, so the first wave
@@ -452,7 +471,7 @@ class KVCacheAwareStrategy:
                 }
             )
 
-        thresh = cap * (1.0 - self.load_threshold)
+        thresh = cap * (1.0 - self.capacity_reserve_threshold)
         cold_start = store.get_sticky_binding(request_id) is None
         if cold_start:
             top = self._first_bind_top([rows[i]["active_sessions"] for i in range(n)])

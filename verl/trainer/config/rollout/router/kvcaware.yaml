@@ -19,6 +19,11 @@ strategies:
     alpha: 0.3
     # overload when load > threshold (load ∈ [0,1], bigger = more loaded)
     load_threshold: 0.6
+    # Threshold semantics split: sticky overload trigger vs capacity reserve
+    # gate. null → fall back to load_threshold (legacy shared behavior).
+    # sticky_overload_threshold: 0.3   # unbind when the bound replica is this hot
+    # capacity_reserve_threshold: 0.9  # replica joins capacity ranking only if
+    #                                  # avail >= cap × (1 - this)
     layer_weights:
       gpu: 0.7
       cpu: 0.2
