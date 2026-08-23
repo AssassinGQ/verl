@@ -162,6 +162,14 @@ def _load_config(
     slow_cut: str | None,
     overload_mode: str | None,
     do_shortcut: bool | None,
+    sticky_overload_threshold: float | None = None,
+    capacity_reserve_threshold: float | None = None,
+    first_bind_window: int | None = None,
+    first_bind_weighted: bool | None = None,
+    skew_window: int | None = None,
+    skew_delta: int | None = None,
+    skew_factor: float | None = None,
+    tie_epsilon: float | None = None,
 ) -> Any:
     """Compose the recipe's training config and override inference fields.
 
@@ -246,6 +254,23 @@ def _load_config(
         strat0.overload_mode = overload_mode
     if do_shortcut is not None:
         strat0.do_shortcut = do_shortcut
+    # P1-P5 knobs (None → yaml/config default)
+    if sticky_overload_threshold is not None:
+        strat0.sticky_overload_threshold = sticky_overload_threshold
+    if capacity_reserve_threshold is not None:
+        strat0.capacity_reserve_threshold = capacity_reserve_threshold
+    if first_bind_window is not None:
+        strat0.first_bind_window = first_bind_window
+    if first_bind_weighted is not None:
+        strat0.first_bind_weighted = first_bind_weighted
+    if skew_window is not None:
+        strat0.skew_window = skew_window
+    if skew_delta is not None:
+        strat0.skew_delta = skew_delta
+    if skew_factor is not None:
+        strat0.skew_factor = skew_factor
+    if tie_epsilon is not None:
+        strat0.tie_epsilon = tie_epsilon
 
     af = ro.custom.agent_framework
     af.gateway_count = gateway_count
@@ -375,6 +400,14 @@ def run_inference(
     slow_cut: str | None,
     overload_mode: str | None,
     do_shortcut: bool | None,
+    sticky_overload_threshold: float | None = None,
+    capacity_reserve_threshold: float | None = None,
+    first_bind_window: int | None = None,
+    first_bind_weighted: bool | None = None,
+    skew_window: int | None = None,
+    skew_delta: int | None = None,
+    skew_factor: float | None = None,
+    tie_epsilon: float | None = None,
 ) -> dict[str, Any]:
     # vLLM's mooncake connector reads MOONCAKE_CONFIG_PATH (not extra_config).
     # Set before ray.init so Ray-spawned workers inherit it.
@@ -412,6 +445,14 @@ def run_inference(
         slow_cut=slow_cut,
         overload_mode=overload_mode,
         do_shortcut=do_shortcut,
+        sticky_overload_threshold=sticky_overload_threshold,
+        capacity_reserve_threshold=capacity_reserve_threshold,
+        first_bind_window=first_bind_window,
+        first_bind_weighted=first_bind_weighted,
+        skew_window=skew_window,
+        skew_delta=skew_delta,
+        skew_factor=skew_factor,
+        tie_epsilon=tie_epsilon,
     )
 
     samples = load_swe_dataset(data_path, max_samples=max_samples, shuffle=shuffle, seed=seed)
@@ -556,7 +597,7 @@ def main():
         "--overload-mode",
         type=str,
         default=None,
-        choices=["None", "kv_cache_usage_perc", "kv_load"],
+        choices=["None", "kv_cache_usage_perc", "kv_load", "skew"],
         help="strategy[0] overload_mode for the sticky short-circuit.",
     )
     parser.add_argument(
@@ -564,6 +605,55 @@ def main():
         action=argparse.BooleanOptionalAction,
         default=None,
         help="strategy[0] do_shortcut master switch (--do-shortcut / --no-do-shortcut).",
+    )
+    # ── P1-P5 knobs (None → kvcaware.yaml default) ──
+    parser.add_argument(
+        "--sticky-overload-threshold",
+        type=float,
+        default=None,
+        help="sticky overload trigger threshold (P3; None → load_threshold).",
+    )
+    parser.add_argument(
+        "--capacity-reserve-threshold",
+        type=float,
+        default=None,
+        help="capacity eligibility reserve threshold (P3; None → load_threshold).",
+    )
+    parser.add_argument(
+        "--first-bind-window",
+        type=int,
+        default=None,
+        help="first-bind tie window in sessions (P2; 0 = strict min).",
+    )
+    parser.add_argument(
+        "--first-bind-weighted",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="weighted (True) vs uniform (False) random within the first-bind window (P2).",
+    )
+    parser.add_argument(
+        "--skew-window",
+        type=int,
+        default=None,
+        help="consecutive skewed snapshots before SKEW overload fires (P4).",
+    )
+    parser.add_argument(
+        "--skew-delta",
+        type=int,
+        default=None,
+        help="active_sessions slack over pool median for the SKEW session line (P4).",
+    )
+    parser.add_argument(
+        "--skew-factor",
+        type=float,
+        default=None,
+        help="running/inflight_tokens ratio over pool median for the SKEW combo line (P4).",
+    )
+    parser.add_argument(
+        "--tie-epsilon",
+        type=float,
+        default=None,
+        help="capacity near-top set width as cap fraction (P5; 0 = strict argmax).",
     )
     args = parser.parse_args()
 
@@ -601,6 +691,14 @@ def main():
         slow_cut=args.slow_cut,
         overload_mode=args.overload_mode,
         do_shortcut=args.do_shortcut,
+        sticky_overload_threshold=args.sticky_overload_threshold,
+        capacity_reserve_threshold=args.capacity_reserve_threshold,
+        first_bind_window=args.first_bind_window,
+        first_bind_weighted=args.first_bind_weighted,
+        skew_window=args.skew_window,
+        skew_delta=args.skew_delta,
+        skew_factor=args.skew_factor,
+        tie_epsilon=args.tie_epsilon,
     )
 
 
