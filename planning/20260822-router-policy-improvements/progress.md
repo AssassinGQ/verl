@@ -51,3 +51,14 @@ plan 已更新：task_plan P1 方案 + Phase 1 产出描述 + D2 改写（原"�
 测试结果：router 全套 326 passed / 7 skipped；e2e 2 例失败为**既有环境问题**（venv 缺 `uni_agent` 模块、缺 `mooncake_http_metadata_server` 二进制，stash 基线同样失败）；strategy 4 例既有失败（测试未传 request_id 被 cold-start 分支截胡）按其本意改用 `sticky={"r1": "rep_gone"}` 钉住 eligible 排序路径后全绿。metric.md/strategy.md 已同步新语义。
 
 下一步：P2（首绑加权随机/quota）。
+
+### 2026/08/23 — P2–P5 落地完成
+
+- **P2 `87faf46a`**：`_first_bind_top`——候选 = min±`first_bind_window`(默认1)，窗内 `random.choices` 按 `window+1−count` 加权（`first_bind_weighted=false` 则均匀）；接入 least-inflight 与 capacity 冷启动两个首绑点。window=0 退化为严格 min。
+- **P3 `c875d1f7`**：`sticky_overload_threshold` / `capacity_reserve_threshold`（默认 None → 回落 load_threshold，行为不变）；`is_overloaded` 与 capacity 门槛各读各的；balancer summary 与 yaml 示例同步。
+- **P4 `e93e049b`**：`OverloadMode.SKEW`——`active_sessions > median+skew_delta`（绝对差）或 `running>且 inflight_tokens> skew_factor×median`（比值），连续 `skew_window`(默认60，sticky-shortcut 节拍采样) 才判 overload；streak 状态在 strategy 内（router actor 单线程免锁）。`is_overloaded` 增可选 `replicas` 参数。
+- **P5 `29ec0085`**：`_near_top_pick`——top 集 = `{i∈pool : remaining[i] >= best − cap×tie_epsilon(默认0.01)}`，均匀抽取；eligible 与 no-eligible 两分支都走；reserve 门槛保持硬过滤（ε 只放宽并列，不救被门槛排除者）。ε=0 退化严格 argmax。
+
+测试：strategy 119 + balancer 41 + ray-integration 5 + config/router 108 全绿；quota（P2 可选项）未实现——窗口+加权已覆盖其目标，等 Phase 6 回放显示需要再加。既有 flaky：balancer 目录混跑时 ray-integration 5 例失败系 conftest session 级 monkeypatch 的条件判断粒度问题（P1 前即存在，单跑/文件级跑均过），未修。
+
+下一步：Phase 6 日志回放（exp1 32K 日志 + `/tmp/reconcile.py` 思路正式化），校准 window/Δ/factor/ε。

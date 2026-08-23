@@ -42,10 +42,10 @@
 |---|---|---|---|
 | 0 | 现有代码结构确认 + 信号可得性核对 | ⏳ pending | 确认 acquire/release 回调链能挂 session 生命周期钩子；确认 store 能维护 per-replica active_sessions；列出每项改动的触点文件清单 |
 | 1 | P1 `active_sessions` 信号 + 首绑 | ✅ done (verl `0bd3ea8f` + uni-agent `1cbdab0`) | binding 派生：ACTIVE_SESSIONS 由 sticky binding put/替换/invalidate 同步维护；GatewayManager 终态回调（默认空）→ entry.py 桥接 → balancer `on_session_end`（invalidate + _fire）；首绑分支读 min(ACTIVE_SESSIONS)；METRIC_SPECS/EMIT_SPECS 各 +1；单测 |
-| 2 | P2 首绑加权随机 / quota | ⏳ pending | 候选集 = 计数最低 ± 窗口；窗口内均匀或按 (max−count+1) 加权；quota 上限可选；单测 |
-| 3 | P3 阈值双语义拆分 | ⏳ pending | config 新增 `sticky_overload_threshold` / `capacity_reserve_threshold`，`load_threshold` 保留向后兼容；capacity 分支与 overload 判据分开读各自阈值；单测 + config 兼容测试 |
-| 4 | P4 overload 组合信号（持续偏斜） | ⏳ pending | 新增 `OverloadMode.SKEW`（或类似）：sustained(active_sessions>median+Δ 或 running>2×median 且 inflight_tokens>2×median，窗口 60s)；仅作用于 sticky shortcut 的 fallback 判定；单测 |
-| 5 | P5 近似 top 随机 | ⏳ pending | capacity 分支 tie-break 从 `remaining == best` 改 `remaining >= best − cap×δ`（δ 默认 0.01，可配）；route() 随机骨架已在（沿用），只改候选集判定；单测 |
+| 2 | P2 首绑加权随机 / quota | ✅ done (`87faf46a`) | 候选集 = 计数最低 ± 窗口；窗口内均匀或按 (max−count+1) 加权；quota 上限可选；单测 |
+| 3 | P3 阈值双语义拆分 | ✅ done (`c875d1f7`) | config 新增 `sticky_overload_threshold` / `capacity_reserve_threshold`，`load_threshold` 保留向后兼容；capacity 分支与 overload 判据分开读各自阈值；单测 + config 兼容测试 |
+| 4 | P4 overload 组合信号（持续偏斜） | ✅ done (`e93e049b`) | 新增 `OverloadMode.SKEW`：sustained(active_sessions>median+Δ 或 running>2×median 且 inflight_tokens>2×median，窗口 60s)；仅作用于 sticky shortcut 的 fallback 判定；单测 |
+| 5 | P5 近似 top 随机 | ✅ done (`29ec0085`) | capacity 分支 tie-break 从 `remaining == best` 改 `remaining >= best − cap×δ`（δ 默认 0.01，可配）；单测 |
 | 6 | 日志回放仿真验证 | ⏳ pending | 用 exp1 32K 日志回放：对比新首绑分布 CV、热点触发率、rebind 次数；离线确认参数（窗口/Δ/δ）不必真机调 |
 | 7 | 真机矩阵重跑（用户执行） | ⏳ pending | 32K/64K 至少各一组 sticky+改进版；产出对齐 exp1 口径的有效阶段表，与 exp1 基线对比 |
 
