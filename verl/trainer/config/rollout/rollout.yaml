@@ -97,7 +97,7 @@ scheduling_policy: fcfs
 
 # Which loader to use for rollout model weights: dummy, hf, megatron, etc.
 # safetensors (for huge model, and set use_shm=True); dummy: randomly init model weight
-load_format: dummy
+load_format: auto
 
 # for huge model, layered summon can save memory (prevent OOM) but make it slower
 layered_summon: False
