@@ -62,6 +62,9 @@ class KVCacheAwareStrategy:
         first_bind_weighted: bool = True,
         sticky_overload_threshold: float | None = None,
         capacity_reserve_threshold: float | None = None,
+        skew_window: int = 60,
+        skew_delta: int = 2,
+        skew_factor: float = 2.0,
     ) -> None:
         if not 0 <= alpha <= 1:
             raise StrategyError(f"alpha must be in [0, 1], got {alpha}")
@@ -104,6 +107,12 @@ class KVCacheAwareStrategy:
         ):
             if value is not None and not 0 < value < 1:
                 raise StrategyError(f"{name} must be in (0, 1) or None, got {value}")
+        if not isinstance(skew_window, int) or skew_window < 1:
+            raise StrategyError(f"skew_window must be a positive int, got {skew_window!r}")
+        if not isinstance(skew_delta, int) or skew_delta < 0:
+            raise StrategyError(f"skew_delta must be a non-negative int, got {skew_delta!r}")
+        if not isinstance(skew_factor, int | float) or skew_factor <= 1.0:
+            raise StrategyError(f"skew_factor must be > 1.0, got {skew_factor!r}")
 
         self.alpha = float(alpha)
         self.load_threshold = float(load_threshold)
@@ -124,6 +133,13 @@ class KVCacheAwareStrategy:
         self.capacity_reserve_threshold = (
             float(capacity_reserve_threshold) if capacity_reserve_threshold is not None else float(load_threshold)
         )
+        self.skew_window = skew_window
+        self.skew_delta = skew_delta
+        self.skew_factor = float(skew_factor)
+        # SKEW streak counter per replica (see _is_skew_overloaded) — the only
+        # mutable state in the strategy; the router actor is single-threaded so
+        # no lock is needed.
+        self._skew_streak: dict[str, int] = {}
         self._max_num_seqs: int | None = None
         self._max_num_batched_tokens: int | None = None
         logger.info(
@@ -133,7 +149,8 @@ class KVCacheAwareStrategy:
             f"slow_cut={self.slow_cut.value}, overload_mode={self.overload_mode.value}, "
             f"first_bind_window={self.first_bind_window}, first_bind_weighted={self.first_bind_weighted}, "
             f"sticky_overload_threshold={self.sticky_overload_threshold:.2f}, "
-            f"capacity_reserve_threshold={self.capacity_reserve_threshold:.2f}"
+            f"capacity_reserve_threshold={self.capacity_reserve_threshold:.2f}, "
+            f"skew=(window={self.skew_window}, delta={self.skew_delta}, factor={self.skew_factor})"
         )
 
     def set_capacity(self, max_num_seqs: int, max_num_batched_tokens: int) -> None:
@@ -167,6 +184,9 @@ class KVCacheAwareStrategy:
             first_bind_weighted=cfg.first_bind_weighted,
             sticky_overload_threshold=cfg.sticky_overload_threshold,
             capacity_reserve_threshold=cfg.capacity_reserve_threshold,
+            skew_window=cfg.skew_window,
+            skew_delta=cfg.skew_delta,
+            skew_factor=cfg.skew_factor,
         )
 
     def _first_bind_top(self, counts: list[int]) -> int:
@@ -225,12 +245,14 @@ class KVCacheAwareStrategy:
         self,
         store: DataStore,
         replica: ReplicaInfo,
+        replicas: list[ReplicaInfo] | None = None,
     ) -> bool:
-        """Return True if ``replica`` is overloaded (``load > sticky_overload_threshold``).
+        """Return True if ``replica`` is overloaded (mode-specific verdict).
 
         Used only by the sticky short-circuit to decide whether to send a
         returning session back to its bound replica. Combined scoring never
-        consults overload.
+        consults overload. ``replicas`` (the candidate pool) is required by
+        SKEW — its medians are pool-relative.
         """
         if self.overload_mode == OverloadMode.NONE:
             return False
@@ -248,9 +270,66 @@ class KVCacheAwareStrategy:
             # Emit the load the sticky check used (the bound replica).
             logger.info(f"is-overload replica={replica.replica_id} kv_load={load:.4f}")
             return load > self.sticky_overload_threshold
+        if self.overload_mode == OverloadMode.SKEW:
+            return self._is_skew_overloaded(store, replica, replicas)
         raise ValueError(
-            f"There is no {self.overload_mode}, please set overload_mode in ['None', 'kv_cache_usage_perc', 'kv_load']"
+            f"There is no {self.overload_mode}, "
+            "please set overload_mode in ['None', 'kv_cache_usage_perc', 'kv_load', 'skew']"
         )
+
+    def _is_skew_overloaded(
+        self,
+        store: DataStore,
+        replica: ReplicaInfo,
+        replicas: list[ReplicaInfo] | None,
+    ) -> bool:
+        """SKEW verdict: sustained pool-relative skew (P4).
+
+        Per call, snapshot the pool's (active_sessions, running,
+        inflight_tokens) and record whether ``replica`` is beyond the skew
+        lines; the verdict fires only when the replica has been skewed in ALL
+        of the last ``skew_window`` snapshots. One clean sample resets the
+        streak. Snapshots ride the sticky-shortcut cadence (sub-second under
+        load), so window ≈ samples × request cadence — no timer thread.
+        """
+        if not replicas:
+            return False
+
+        def med(values: list[float]) -> float:
+            ordered = sorted(values)
+            mid = len(ordered) // 2
+            return ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2.0
+
+        ids = [r.replica_id for r in replicas]
+        sessions = [store.get_metric(rid, MetricKey.ACTIVE_SESSIONS) or 0 for rid in ids]
+        running = [store.get_metric(rid, MetricKey.NUM_REQUESTS_RUNNING) or 0 for rid in ids]
+        tokens = [store.get_metric(rid, MetricKey.INFLIGHT_TOKENS) or 0 for rid in ids]
+        med_sessions = med(sessions)
+        med_running = med(running)
+        med_tokens = med(tokens)
+
+        idx = ids.index(replica.replica_id)
+        session_skew = sessions[idx] > med_sessions + self.skew_delta
+        combo_skew = running[idx] > self.skew_factor * med_running and tokens[idx] > self.skew_factor * med_tokens
+        skewed = session_skew or combo_skew
+
+        streak = self._skew_streak.get(replica.replica_id, 0)
+        streak = streak + 1 if skewed else 0
+        self._skew_streak[replica.replica_id] = streak
+
+        if streak >= self.skew_window:
+            logger.info(
+                f"is-overload replica={replica.replica_id} skew streak={streak}/{self.skew_window} "
+                f"(sessions {sessions[idx]} vs med {med_sessions}, running {running[idx]} vs med {med_running}, "
+                f"tokens {tokens[idx]} vs med {med_tokens}) → OVERLOADED"
+            )
+            return True
+        logger.debug(
+            f"is-overload replica={replica.replica_id} skew streak={streak}/{self.skew_window} "
+            f"(sessions={sessions[idx]}/med={med_sessions} running={running[idx]}/med={med_running} "
+            f"tokens={tokens[idx]}/med={med_tokens})"
+        )
+        return False
 
     def _sticky_shortcut(
         self,
@@ -274,7 +353,7 @@ class KVCacheAwareStrategy:
             return None
         for idx, replica in enumerate(replicas):
             if replica.replica_id == sticky_id:
-                if self.is_overloaded(store, replica):
+                if self.is_overloaded(store, replica, replicas):
                     logger.info(f"score(): STICKY replica={sticky_id} OVERLOADED → fallback")
                     return None
                 logger.info(f"score(): STICKY replica={sticky_id} HIT → short-circuit (top score)")

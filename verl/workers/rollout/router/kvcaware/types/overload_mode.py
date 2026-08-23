@@ -35,5 +35,12 @@ class OverloadMode(str, Enum):
     KV_CACHE_USAGE_PERC = "kv_cache_usage_perc"
     # _compute_load(kv, running, waiting, inflight) > load_threshold
     KV_LOAD = "kv_load"
+    # Sustained relative skew vs the pool median (P4): a replica that has held
+    # active_sessions > median+delta, or running AND inflight_tokens both above
+    # factor×median, for the whole window is treated as overloaded — catching
+    # the "KV not full but running 4× the pool" hotspot shape absolute
+    # thresholds structurally miss (27.24: running ~13 vs pool median ~3, KV
+    # 0.2). Relative to the pool, so it is context-length agnostic.
+    SKEW = "skew"
     # do not do overload
     NONE = "None"

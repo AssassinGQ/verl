@@ -44,6 +44,19 @@ class KVCAwareStrategyConfig(StrategyConfig):
     # None → fall back to load_threshold (exact legacy behavior).
     sticky_overload_threshold: float | None = None
     capacity_reserve_threshold: float | None = None
+    # ── SKEW overload mode (P4; read only when overload_mode == "skew") ──
+    # skew_window: number of consecutive pool-snapshot samples a replica must
+    # stay beyond the skew lines to count as "sustained". Snapshots are taken
+    # per is_overloaded call (sticky shortcut path), NOT on a timer — under
+    # load that is request-cadence (~sub-second), so window≈samples×cadence.
+    # Default 60 targets ~60s of sustained skew at request cadence.
+    skew_window: int = 60
+    # active_sessions > median + skew_delta counts as skewed (absolute session
+    # slack — small integers, so delta not ratio).
+    skew_delta: int = 2
+    # running AND inflight_tokens both > skew_factor × pool median counts as
+    # skewed (ratio form for the large-range signals).
+    skew_factor: float = 2.0
     layer_weights: dict[Layer, float] = field(default_factory=lambda: {Layer.GPU: 0.7, Layer.CPU: 0.2, Layer.SSD: 0.1})
     # Sticky short-circuit: when True, a returning session is sent back to its
     # bound replica only if that replica is NOT overloaded (load > load_threshold).
@@ -77,6 +90,12 @@ class KVCAwareStrategyConfig(StrategyConfig):
             value = getattr(self, name)
             if value is not None and not 0 < value < 1:
                 raise ConfigError(f"{name} must be in (0, 1) or None, got {value}")
+        if not isinstance(self.skew_window, int) or self.skew_window < 1:
+            raise ConfigError(f"skew_window must be a positive int, got {self.skew_window!r}")
+        if not isinstance(self.skew_delta, int) or self.skew_delta < 0:
+            raise ConfigError(f"skew_delta must be a non-negative int, got {self.skew_delta!r}")
+        if not isinstance(self.skew_factor, int | float) or self.skew_factor <= 1.0:
+            raise ConfigError(f"skew_factor must be > 1.0, got {self.skew_factor!r}")
         if not isinstance(self.memory_overload_filter, bool):
             raise ConfigError(f"memory_overload_filter must be a bool, got {self.memory_overload_filter!r}")
         if not isinstance(self.do_shortcut, bool):
