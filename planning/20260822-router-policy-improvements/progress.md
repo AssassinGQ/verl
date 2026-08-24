@@ -67,3 +67,10 @@ plan 已更新：task_plan P1 方案 + Phase 1 产出描述 + D2 改写（原"�
 - uni-agent `router` → `origin/router`：P1 桥接 commit `1cbdab0` 已在远端（用户后续提交 `0618505`/`f54f14e` 叠于其上）。
 
 下一步：Phase 6 日志回放（exp1 32K 日志 + `/tmp/reconcile.py` 思路正式化），校准 window/Δ/factor/ε。
+
+## 2026/08/24 — Phase 8：skill 文档同步
+
+审计 results/skill/ 八个文档与 P1-P5 代码的差异（完整审计见 findings §8）：README 三处悬空引用 +
+TL;DR 两处过时（单赢家 bug 已被 P5 修复、首绑语义已变）+ 无 P1-P5 信息；04/05 遗留待合并；
+framework.md 缺 P1 桥接；exp1.md 缺演进指针；五个文档 untracked。README 头部/索引/当前代码状态节已改完，
+剩 TL;DR 与尾部版本说明。（注：曾误开 planning/20260824-skill-docs-sync/，已并入本文件组并删除。）

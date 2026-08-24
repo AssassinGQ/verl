@@ -100,3 +100,47 @@ collector 实际 poll ≈150ms（exp1 实测，yaml 写 0.05s 有 ~3× 放大）
 - 对账脚本思路已验证：`request=session-<sample>-<session>-<uuid>` 直接解析 (sample, session)，join runner start/end（`/tmp/reconcile.py`，正式化后入 repo scripts/）
 - Prometheus 已可本地起（promtool/prometheus 二进制在 `~/.rl-insight/services/prometheus/2.54.1/`），日志时间 = UTC 查询时间已验证
 - 回放判据基线：首绑 CV（0.420/0.313）、27.24 形态（running 12.98 vs median ~3）、timeout 首绑集中度（sticky 24/37、kvcaware 69/90）
+## §8 文档同步：过时点审计（2026-08-24）
+
+### README.md
+- L8 "依据代码版本：容器 e60b08d2…见 01" —— 01 已删除，引用悬空
+- L19-25 索引表：`strategy.md` 出现两次（重复行）；04/05 仍在索引
+- L28 阅读顺序 "01 → 02 → 03" —— 三个文件都已删除/合并
+- L70-71 TL;DR："单赢家 bug"（浮点严格相等）—— P5（`29ec0085`）已修：top 集放宽为 `remaining >= best − cap×tie_epsilon`
+- TL;DR "sticky = 首个按 inflight 个数最少接" —— P1 后是 `min(active_sessions)` 窗口随机
+- 缺：P1-P5 已落地的任何信息
+
+### 04_分析建议.md（15 行）
+通用判读建议（负载均衡/前缀命中/面板），无历史独有数据 → 并入 analysis.md。
+
+### 05_128K实测对比（117 行）
+与 exp2.md 同题材（0821 128×128000）。exp2.md 是对账后的完整版（有效阶段表、挂死路由数、session 分布）；
+需核对 05 是否有 exp2 未覆盖的增量（初步 diff：05 的"27.24 单赢家案例"细节 exp2 §4.4 已覆盖）。
+
+### framework.md
+描述 session 展开与 Resolved，无 P1 桥接信息（callback → on_session_end → binding 失效）。
+
+### exp1.md
+L17 "运行版本 容器 e60b08d2" 正确（历史事实，不改）；L132 单赢家描述正确（当时代码确实如此）。
+缺一个"代码已演进"指针，否则读者会以为问题仍在。
+
+### metric.md / strategy.md
+P1/P5 时已同步（active_sessions、skew、tie_epsilon 都在）——无需再改，除非 Phase 1-4 触及。
+
+## §9 文档同步：当前代码状态速记（写 README 用）
+
+| 项 | commit | 一句话 |
+|---|---|---|
+| P1 active_sessions | verl `0bd3ea8f` + uni-agent `44f1b84` | 首绑按存活 session 数；binding 表单一事实源；gateway 终态回调 → Ray fire-and-forget |
+| P2 窗口随机首绑 | `87faf46a` | min±first_bind_window(1) 内加权随机 |
+| P3 阈值拆分 | `c875d1f7` | sticky_overload_threshold / capacity_reserve_threshold（None 回落） |
+| P4 SKEW | `e93e049b` | 池中位数持续偏斜判过载（sessions 绝对差 / running+tokens 比值 AND） |
+| P5 near-top | `29ec0085` | top 集放宽 cap×tie_epsilon(0.01)，均匀随机；修掉单赢家崩塌 |
+| CLI 暴露 | `3a13c487` | parallel_infer.py 全部新参数 flag |
+
+降级语义：uni-agent 侧无桥接时 active_sessions 退化为累计首绑数（合法首绑信号，失去存活语义）。
+
+## §10 文档同步：git 状态
+
+results/skill/ 下 untracked：README.md、analysis.md、exp1.md、exp2.md、framework.md、04、05
+（metric.md、strategy.md 已随 P1/P5 commit 入库）。Phase 5 一并提交。
