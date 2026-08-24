@@ -48,7 +48,7 @@
 | 5 | P5 近似 top 随机 | ✅ done (`29ec0085`) | capacity 分支 tie-break 从 `remaining == best` 改 `remaining >= best − cap×δ`（δ 默认 0.01，可配）；单测 |
 | 6 | 日志回放仿真验证 | ⏳ pending | 用 exp1 32K 日志回放：对比新首绑分布 CV、热点触发率、rebind 次数；离线确认参数（窗口/Δ/δ）不必真机调 |
 | 7 | 真机矩阵重跑（用户执行） | ⏳ pending | 32K/64K 至少各一组 sticky+改进版；产出对齐 exp1 口径的有效阶段表，与 exp1 基线对比 |
-| 8 | skill 文档同步（2026/08/24） | 🔄 in progress | README（悬空引用/TL;DR/当前代码状态节，已半完成）；04/05 并入 analysis/exp2 后删除；framework.md 补 P1 桥接；exp1.md 加演进指针；未入库文档一并提交 |
+| 8 | skill 文档同步（2026/08/24） | ✅ done (`0c907471`) | README（悬空引用/TL;DR/当前代码状态节，已半完成）；04/05 并入 analysis/exp2 后删除；framework.md 补 P1 桥接；exp1.md 加演进指针；未入库文档一并提交 |
 
 ## 各项方案细节
 
