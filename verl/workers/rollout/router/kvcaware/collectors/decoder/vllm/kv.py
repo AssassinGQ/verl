@@ -30,6 +30,8 @@ from ....utils.hash import compute_hash
 
 logger = get_router_logger("vllm-kv")
 
+RemoteBlockKey = tuple[str, int | None, int | None, str]
+
 
 class VLLMKVDecoder(Decoder):
     """vLLM KV-cache decoder — msgpack payload → KVCacheUpdate.
@@ -38,8 +40,8 @@ class VLLMKVDecoder(Decoder):
     ``KVCacheUpdate`` accumulator; ``decode`` is pure dispatch.
 
     Attributes:
-        remote_to_local_block_hash: Mapping from vLLM remote block_hash
-            to locally-computed prefix hash (str).  Used for chained
+        remote_to_local_block_hash: Mapping from source-scoped vLLM block
+            identity to locally-computed prefix hash (str). Used for chained
             hash computation.
         _block_size: Learned block size from first event.
     """
@@ -49,7 +51,7 @@ class VLLMKVDecoder(Decoder):
     _MEDIUM_TO_LAYER: dict[str, Layer] = {"GPU": Layer.GPU, "cpu": Layer.CPU}
 
     def __init__(self) -> None:
-        self.remote_to_local_block_hash: dict[str, str] = {}
+        self.remote_to_local_block_hash: dict[RemoteBlockKey, str] = {}
         self._block_size: int | None = None
 
     def decode(self, raw_data: bytes | str, node_id: str) -> KVCacheUpdate | None:
@@ -99,6 +101,16 @@ class VLLMKVDecoder(Decoder):
             )
             return None
 
+    @staticmethod
+    def _remote_block_key(event: KVCacheEvent, block_hash: str) -> RemoteBlockKey:
+        """Return the source scope and remote hash that identify one block."""
+        return (
+            event.node_id,
+            event.data_parallel_rank,
+            event.group_idx,
+            block_hash,
+        )
+
     @classmethod
     def _medium_to_layer(cls, medium: str | None) -> Layer:
         """Map a vLLM ``medium`` to a canonical layer; None/unknown → GPU."""
@@ -119,7 +131,8 @@ class VLLMKVDecoder(Decoder):
         seed = 0
         local_parent_hash = seed
         if event.parent_block_hash is not None:
-            local_parent_str = self.remote_to_local_block_hash.get(event.parent_block_hash)
+            parent_key = self._remote_block_key(event, event.parent_block_hash)
+            local_parent_str = self.remote_to_local_block_hash.get(parent_key)
             if local_parent_str is not None:
                 local_parent_hash = int(local_parent_str)
 
@@ -134,7 +147,8 @@ class VLLMKVDecoder(Decoder):
             )
             local_hash_str = str(local_hash_int)
             bh = event.block_hashes[i]
-            self.remote_to_local_block_hash[bh] = local_hash_str
+            block_key = self._remote_block_key(event, bh)
+            self.remote_to_local_block_hash[block_key] = local_hash_str
             local_hashes.append(local_hash_str)
             local_parent_hash = local_hash_int  # chain
 
@@ -142,11 +156,12 @@ class VLLMKVDecoder(Decoder):
 
     def _on_block_removed(self, event: KVCacheEvent, update: KVCacheUpdate) -> None:
         """Handle BlockRemoved: convert remote hashes to local, fold into update."""
-        local_hashes = [
-            self.remote_to_local_block_hash[bh] for bh in event.block_hashes if bh in self.remote_to_local_block_hash
-        ]
-        for bh in event.block_hashes:
-            self.remote_to_local_block_hash.pop(bh, None)
+        local_hashes: list[str] = []
+        for block_hash in event.block_hashes:
+            block_key = self._remote_block_key(event, block_hash)
+            local_hash = self.remote_to_local_block_hash.pop(block_key, None)
+            if local_hash is not None:
+                local_hashes.append(local_hash)
 
         update.remove(self._medium_to_layer(event.medium), local_hashes)
 

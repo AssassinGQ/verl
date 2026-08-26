@@ -30,6 +30,32 @@ def _stored_event(block_hash, parent, token_ids, block_size, medium):
     return ["stored", [block_hash], parent, token_ids, block_size, None, medium]
 
 
+def _dict_stored_event(block_hash, token_ids, *, group_idx, parent=None, medium="GPU"):
+    return {
+        "type": "BlockStored",
+        "block_hashes": [block_hash],
+        "parent_block_hash": parent,
+        "token_ids": token_ids,
+        "block_size": 2,
+        "medium": medium,
+        "group_idx": group_idx,
+    }
+
+
+def _dict_removed_event(block_hash, *, group_idx, medium="GPU"):
+    return {
+        "type": "BlockRemoved",
+        "block_hashes": [block_hash],
+        "medium": medium,
+        "group_idx": group_idx,
+    }
+
+
+def _decode_event(decoder, event, node_id, data_parallel_rank):
+    payload = [0, [event], data_parallel_rank]
+    return decoder.decode(msgpack.packb(payload), node_id)
+
+
 def test_mixed_medium_frame_buckets_per_layer():
     """A single frame with a GPU and a cpu BlockStored keeps layers distinct.
 
@@ -106,3 +132,100 @@ def test_decode_failure_surfaces_exception_not_swallowed():
     assert "{exc}" not in text  # placeholder must be gone
     assert "node1" in text  # node_id must interpolate
     assert "len=" in text and "head=c1c1c1" in text  # diagnostic preview present
+
+
+def test_remote_hash_mapping_is_scoped_by_replica_dp_rank_and_group():
+    decoder = VLLMKVDecoder()
+    scopes = [
+        ("replica-a", 0, 0, [1, 2]),
+        ("replica-b", 0, 0, [3, 4]),
+        ("replica-a", 1, 0, [5, 6]),
+        ("replica-a", 0, 1, [7, 8]),
+    ]
+    local_hashes = {}
+
+    for node_id, dp_rank, group_idx, token_ids in scopes:
+        update = _decode_event(
+            decoder,
+            _dict_stored_event("shared-remote-hash", token_ids, group_idx=group_idx),
+            node_id,
+            dp_rank,
+        )
+        assert update is not None
+        local_hashes[(node_id, dp_rank, group_idx)] = update.add_blocks[Layer.GPU][0]
+
+    assert len(set(local_hashes.values())) == len(scopes)
+    expected_keys = {(node_id, dp_rank, group_idx, "shared-remote-hash") for node_id, dp_rank, group_idx, _ in scopes}
+    assert set(decoder.remote_to_local_block_hash) == expected_keys
+
+    for node_id, dp_rank, group_idx, _ in scopes:
+        update = _decode_event(
+            decoder,
+            _dict_removed_event("shared-remote-hash", group_idx=group_idx),
+            node_id,
+            dp_rank,
+        )
+        assert update is not None
+        assert update.remove_blocks[Layer.GPU] == [local_hashes[(node_id, dp_rank, group_idx)]]
+        assert (node_id, dp_rank, group_idx, "shared-remote-hash") not in decoder.remote_to_local_block_hash
+
+
+def test_parent_lookup_uses_the_same_group_scope():
+    decoder = VLLMKVDecoder()
+
+    for group_idx, token_ids in [(0, [1, 2]), (1, [3, 4])]:
+        _decode_event(
+            decoder,
+            _dict_stored_event("parent", token_ids, group_idx=group_idx),
+            "replica-a",
+            0,
+        )
+
+    child_hashes = []
+    for group_idx in (0, 1):
+        update = _decode_event(
+            decoder,
+            _dict_stored_event("child", [5, 6], group_idx=group_idx, parent="parent"),
+            "replica-a",
+            0,
+        )
+        assert update is not None
+        child_hashes.append(update.add_blocks[Layer.GPU][0])
+
+    assert child_hashes[0] != child_hashes[1]
+
+
+def test_legacy_group_scope_is_used_for_store_and_remove():
+    decoder = VLLMKVDecoder()
+    stored_payload = [
+        0,
+        [["stored", ["legacy-hash"], None, [1, 2], 2, None, "GPU", None, [None], 5]],
+    ]
+    removed_payload = [0, [["removed", ["legacy-hash"], "GPU", 5]]]
+
+    stored_update = decoder.decode(msgpack.packb(stored_payload), "replica-a")
+    removed_update = decoder.decode(msgpack.packb(removed_payload), "replica-a")
+
+    assert stored_update is not None
+    assert removed_update is not None
+    assert removed_update.remove_blocks[Layer.GPU] == stored_update.add_blocks[Layer.GPU]
+
+
+def test_legacy_and_current_events_compute_the_same_local_hash():
+    legacy_decoder = VLLMKVDecoder()
+    current_decoder = VLLMKVDecoder()
+
+    legacy_update = legacy_decoder.decode(
+        msgpack.packb([0, [_stored_event("legacy-hash", None, [1, 2], 2, "GPU")]]),
+        "replica-a",
+    )
+    current_update = _decode_event(
+        current_decoder,
+        _dict_stored_event("current-hash", [1, 2], group_idx=0),
+        "replica-a",
+        0,
+    )
+
+    assert legacy_update is not None
+    assert current_update is not None
+    assert legacy_update.add_blocks[Layer.GPU] == current_update.add_blocks[Layer.GPU]

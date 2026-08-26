@@ -19,6 +19,7 @@ KVCacheEvent — standardized KV cache event data structure.
 from __future__ import annotations
 
 import struct
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -29,7 +30,7 @@ class KVCacheEvent:
 
     Attributes:
         event_type: ``"stored"`` / ``"removed"`` / ``"clear"``.
-        node_id: Source endpoint (from ZMQ connection or group_idx).
+        node_id: Source endpoint from the ZMQ connection.
         block_hashes: Block hashes involved in the event (list from msgpack).
         parent_block_hash: Parent block hash — single value shared by all
                            block_hashes in a BlockStored event.
@@ -37,6 +38,12 @@ class KVCacheEvent:
                    in BlockStored events).  Each element is one full block
                    encoded as uint32 big-endian (4 bytes per token).
         block_size: Block size (only present in BlockStored events).
+        group_idx: KV cache group that owns the block.
+        extra_keys: Additional block-identity keys, for example multimodal inputs.
+        kv_cache_spec_kind: KV cache specification kind for the group.
+        kv_cache_spec_sliding_window: Sliding-window size when applicable.
+        locality: Optional cache locality reported by vLLM.
+        data_parallel_rank: vLLM data-parallel rank from the event-batch envelope.
     """
 
     event_type: str
@@ -46,26 +53,28 @@ class KVCacheEvent:
     token_ids: list[bytes] | None
     block_size: int | None
     medium: str | None = None
+    group_idx: int | None = None
+    extra_keys: list[Any] | None = None
+    kv_cache_spec_kind: str | None = None
+    kv_cache_spec_sliding_window: int | None = None
+    locality: str | None = None
+    data_parallel_rank: int | None = None
 
     # ── Factory ──────────────────────────────────────────────────────────
 
     @classmethod
     def from_raw(cls, raw_data: Any, default_node_id: str | None = None) -> list[KVCacheEvent]:
-        """Parse msgpack-decoded raw data into a list of KVCacheEvent instances.
+        """Parse a msgpack-decoded vLLM event batch.
 
-        Parsing pattern::
-
-            timestamp    = raw_data[0]               # ignored for routing
-            event_list   = raw_data[1]               # list of events
-            event_tag    = raw_data[1][i][0]          # tag for event i
-            event_fields = raw_data[1][i][1:]         # fields for event i
+        Current vLLM batches use ``[timestamp, [event_dict, ...],\n        data_parallel_rank]``.
+        Legacy batches use positional event lists and may omit ``data_parallel_rank``.
 
         Args:
-            raw_data: Msgpack-decoded list ``[timestamp, [[tag, fields...], ...]]``.
-            default_node_id: Fallback node_id when raw data lacks it.
+            raw_data: Msgpack-decoded event batch.
+            default_node_id: Source endpoint used as the event node_id.
 
         Returns:
-            A list of KVCacheEvent instances.  Malformed events are skipped.
+            A list of normalized events. Malformed or unknown events are skipped.
 
         Raises:
             ValueError: If the top-level format is invalid.
@@ -77,23 +86,28 @@ class KVCacheEvent:
         if not isinstance(event_list, list | tuple):
             raise ValueError(f"Expected raw_data[1] as event list, got {type(event_list)}")
 
+        data_parallel_rank = cls._opt_int(raw_data, 2)
         results: list[KVCacheEvent] = []
         for event_entry in event_list:
-            if not isinstance(event_entry, list | tuple) or len(event_entry) < 1:
-                continue
-
-            tag = event_entry[0]
-            fields = event_entry[1:]
-            event_type = cls._resolve_event_type(tag)
-            if event_type.startswith("unknown"):
-                continue
-
-            node_id = default_node_id or ""
             try:
-                event = cls._build_event(event_type, fields, node_id)
+                node_id = default_node_id or ""
+                if isinstance(event_entry, Mapping):
+                    event_type = cls._resolve_event_type(event_entry.get("type"))
+                    event = cls._build_event(event_type, event_entry, node_id, data_parallel_rank)
+                elif isinstance(event_entry, list | tuple) and event_entry:
+                    event_type = cls._resolve_event_type(event_entry[0])
+                    event = cls._build_legacy_event(
+                        event_type,
+                        event_entry[1:],
+                        node_id,
+                        data_parallel_rank,
+                    )
+                else:
+                    continue
+
                 if event is not None:
                     results.append(event)
-            except (ValueError, TypeError, IndexError):
+            except (KeyError, ValueError, TypeError, IndexError):
                 continue
 
         return results
@@ -101,55 +115,82 @@ class KVCacheEvent:
     # ── Build helpers ────────────────────────────────────────────────────
 
     @classmethod
-    def _build_event(
+    def _build_legacy_event(
         cls,
         event_type: str,
         fields: list | tuple,
         node_id: str,
+        data_parallel_rank: int | None,
     ) -> KVCacheEvent | None:
-        """Dispatch to the appropriate builder by event_type."""
+        """Build an event from the legacy positional vLLM format."""
         if event_type == "stored":
-            return cls._build_block_stored(fields, node_id)
+            return cls._build_legacy_block_stored(fields, node_id, data_parallel_rank)
         elif event_type == "removed":
-            return cls._build_block_removed(fields, node_id)
+            return cls._build_legacy_block_removed(fields, node_id, data_parallel_rank)
         elif event_type == "clear":
-            return cls._build_all_blocks_cleared(node_id)
+            return cls._build_all_blocks_cleared(node_id, data_parallel_rank)
+        return None
+
+    @classmethod
+    def _build_event(
+        cls,
+        event_type: str,
+        fields: Mapping[str, Any],
+        node_id: str,
+        data_parallel_rank: int | None,
+    ) -> KVCacheEvent | None:
+        """Build an event from the current dictionary vLLM format."""
+        if event_type == "stored":
+            return cls._build_block_stored(fields, node_id, data_parallel_rank)
+        elif event_type == "removed":
+            return cls._build_block_removed(fields, node_id, data_parallel_rank)
+        elif event_type == "clear":
+            return cls._build_all_blocks_cleared(node_id, data_parallel_rank)
         return None
 
     @staticmethod
     def _opt_str(fields: list | tuple, idx: int) -> str | None:
-        """A field as str, or None when absent/None.
-
-        Older vLLM omits trailing event fields, so absence is normal here.
-        """
+        """Return a positional field as str, or None when absent."""
         if idx >= len(fields) or fields[idx] is None:
             return None
         return str(fields[idx])
 
+    @staticmethod
+    def _opt_int(fields: list | tuple, idx: int) -> int | None:
+        """Return a positional field as int, or None when absent."""
+        if idx >= len(fields) or fields[idx] is None:
+            return None
+        return int(fields[idx])
+
+    @staticmethod
+    def _mapping_opt_str(fields: Mapping[str, Any], key: str) -> str | None:
+        """Return a mapping field as str, or None when absent."""
+        value = fields.get(key)
+        return str(value) if value is not None else None
+
+    @staticmethod
+    def _mapping_opt_int(fields: Mapping[str, Any], key: str) -> int | None:
+        """Return a mapping field as int, or None when absent."""
+        value = fields.get(key)
+        return int(value) if value is not None else None
+
     @classmethod
-    def _build_block_stored(cls, fields: list | tuple, node_id: str) -> KVCacheEvent:
-        """Build a BlockStored event from its field list.
-
-        Field order (after tag):
-            0: block_hashes         — list of block hash values
-            1: parent_block_hash    — single value or None
-            2: token_ids            — list of int or None
-            3: block_size           — int
-
-        Raw ``token_ids`` (``list[int]``) are chopped into full blocks
-        and encoded as uint32 big-endian bytes via ``_convert_token_ids``.
-        """
+    def _build_legacy_block_stored(
+        cls,
+        fields: list | tuple,
+        node_id: str,
+        data_parallel_rank: int | None,
+    ) -> KVCacheEvent:
+        """Build a BlockStored event from its legacy positional fields."""
         if len(fields) < 4:
             raise ValueError(f"BlockStored needs >= 4 fields, got {len(fields)}")
 
-        block_hashes = [str(bh) for bh in fields[0]]
+        block_hashes = [str(block_hash) for block_hash in fields[0]]
         parent_block_hash = str(fields[1]) if fields[1] is not None else None
         raw_token_ids = list(fields[2]) if fields[2] is not None else None
         block_size = int(fields[3])
-        medium = cls._opt_str(fields, 5)  # vLLM medium: "GPU" / "cpu"
-
-        # Chop and encode token IDs into block-sized uint32 big-endian bytes
         token_ids = _convert_token_ids(raw_token_ids, block_size) if raw_token_ids is not None else None
+        raw_extra_keys = fields[7] if len(fields) > 7 else None
 
         return cls(
             event_type="stored",
@@ -158,34 +199,88 @@ class KVCacheEvent:
             parent_block_hash=parent_block_hash,
             token_ids=token_ids,
             block_size=block_size,
-            medium=medium,
+            medium=cls._opt_str(fields, 5),
+            data_parallel_rank=data_parallel_rank,
+            group_idx=cls._opt_int(fields, 8),
+            extra_keys=list(raw_extra_keys) if raw_extra_keys is not None else None,
         )
 
     @classmethod
-    def _build_block_removed(cls, fields: list | tuple, node_id: str) -> KVCacheEvent:
-        """Build a BlockRemoved event from its field list.
-
-        Field order (after tag):
-            0: block_hashes — list of block hash values
-            1: medium       — str or None
-            2: group_idx    — int or None
-        """
-        block_hashes = [str(bh) for bh in fields[0]]
-        medium = cls._opt_str(fields, 1)
-
+    def _build_legacy_block_removed(
+        cls,
+        fields: list | tuple,
+        node_id: str,
+        data_parallel_rank: int | None,
+    ) -> KVCacheEvent:
+        """Build a BlockRemoved event from its legacy positional fields."""
         return cls(
             event_type="removed",
             node_id=node_id,
-            block_hashes=block_hashes,
+            block_hashes=[str(block_hash) for block_hash in fields[0]],
             parent_block_hash=None,
             token_ids=None,
             block_size=None,
-            medium=medium,
+            medium=cls._opt_str(fields, 1),
+            data_parallel_rank=data_parallel_rank,
+            group_idx=cls._opt_int(fields, 2),
         )
 
     @classmethod
-    def _build_all_blocks_cleared(cls, node_id: str) -> KVCacheEvent:
-        """Build an AllBlocksCleared event — no fields after tag."""
+    def _build_block_stored(
+        cls,
+        fields: Mapping[str, Any],
+        node_id: str,
+        data_parallel_rank: int | None,
+    ) -> KVCacheEvent:
+        """Build a BlockStored event from the current dictionary format."""
+        raw_token_ids = fields.get("token_ids")
+        block_size = int(fields["block_size"])
+        raw_extra_keys = fields.get("extra_keys")
+
+        return cls(
+            event_type="stored",
+            node_id=node_id,
+            block_hashes=[str(block_hash) for block_hash in fields["block_hashes"]],
+            parent_block_hash=cls._mapping_opt_str(fields, "parent_block_hash"),
+            token_ids=(_convert_token_ids(list(raw_token_ids), block_size) if raw_token_ids is not None else None),
+            block_size=block_size,
+            medium=cls._mapping_opt_str(fields, "medium"),
+            data_parallel_rank=data_parallel_rank,
+            group_idx=cls._mapping_opt_int(fields, "group_idx"),
+            extra_keys=list(raw_extra_keys) if raw_extra_keys is not None else None,
+            kv_cache_spec_kind=cls._mapping_opt_str(fields, "kv_cache_spec_kind"),
+            kv_cache_spec_sliding_window=cls._mapping_opt_int(fields, "kv_cache_spec_sliding_window"),
+            locality=cls._mapping_opt_str(fields, "locality"),
+        )
+
+    @classmethod
+    def _build_block_removed(
+        cls,
+        fields: Mapping[str, Any],
+        node_id: str,
+        data_parallel_rank: int | None,
+    ) -> KVCacheEvent:
+        """Build a BlockRemoved event from the current dictionary format."""
+        return cls(
+            event_type="removed",
+            node_id=node_id,
+            block_hashes=[str(block_hash) for block_hash in fields["block_hashes"]],
+            parent_block_hash=None,
+            token_ids=None,
+            block_size=None,
+            medium=cls._mapping_opt_str(fields, "medium"),
+            data_parallel_rank=data_parallel_rank,
+            group_idx=cls._mapping_opt_int(fields, "group_idx"),
+            locality=cls._mapping_opt_str(fields, "locality"),
+        )
+
+    @classmethod
+    def _build_all_blocks_cleared(
+        cls,
+        node_id: str,
+        data_parallel_rank: int | None,
+    ) -> KVCacheEvent:
+        """Build an AllBlocksCleared event."""
         return cls(
             event_type="clear",
             node_id=node_id,
@@ -193,6 +288,7 @@ class KVCacheEvent:
             parent_block_hash=None,
             token_ids=None,
             block_size=None,
+            data_parallel_rank=data_parallel_rank,
         )
 
     # ── Tag resolution ───────────────────────────────────────────────────
