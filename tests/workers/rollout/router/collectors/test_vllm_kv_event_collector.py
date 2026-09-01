@@ -43,6 +43,15 @@ def _make_collector():
     )
 
 
+def _legacy_store() -> DataStore:
+    """Explicitly assert this Qwen3 fixture is one Full Attention group."""
+    store = DataStore()
+    store.clear_kv_node(NODE_ID)
+    store.reset_cache_group_registry([NODE_ID], legacy_fallback_enabled=True)
+    store.begin_legacy_single_group_fallback(["0.21.0"])
+    return store
+
+
 @pytest.mark.st
 @pytest.mark.gpu
 class TestVLLMKVEventCollectorWithRealService:
@@ -52,11 +61,11 @@ class TestVLLMKVEventCollectorWithRealService:
         """
         Feature: Collector receives ZMQ events and updates KV cache store
         Expectation:
-            block_size is set (learned from first event).
+            legacy Registry activates after the first valid group-0 event.
             At least one block is cached.
             NODE_ID appears in at least one cached block.
         """
-        store = DataStore()
+        store = _legacy_store()
         collector = _make_collector()
 
         collector.start()
@@ -76,7 +85,7 @@ class TestVLLMKVEventCollectorWithRealService:
         Expectation:
             block_size is a positive integer (vLLM default is 16).
         """
-        store = DataStore()
+        store = _legacy_store()
         collector = _make_collector()
 
         collector.start()
@@ -95,7 +104,7 @@ class TestVLLMKVEventCollectorWithRealService:
         Expectation:
             After multiple requests, the KV cache has entries.
         """
-        store = DataStore()
+        store = _legacy_store()
         collector = _make_collector()
 
         collector.start()
@@ -118,7 +127,7 @@ class TestVLLMKVEventCollectorWithRealService:
         Expectation:
             After clear_kv_node, NODE_ID no longer appears in any cached block.
         """
-        store = DataStore()
+        store = _legacy_store()
         collector = _make_collector()
 
         collector.start()
@@ -144,9 +153,10 @@ class TestVLLMKVEventCollectorWithRealService:
             and that every local hash appears in the KV cache store.
         Expectation:
             remote_to_local_block_hash is non-empty.
-            All local hashes are present in the KV cache store.
+            Keys retain the source node, DP rank, and normalized group.
+            All local hashes are present in the matching KV cache group.
         """
-        store = DataStore()
+        store = _legacy_store()
         collector = _make_collector()
 
         collector.start()
@@ -157,7 +167,12 @@ class TestVLLMKVEventCollectorWithRealService:
 
         mapping = collector._decoder.remote_to_local_block_hash
         assert len(mapping) > 0, "remote_to_local_block_hash should have entries after processing events"
-        for remote_bh, local_bh in mapping.items():
+        for remote_key, local_bh in mapping.items():
+            node_id, dp_rank, remote_bh = remote_key
+            assert node_id == NODE_ID
+            assert dp_rank is None or isinstance(dp_rank, int)
             assert isinstance(remote_bh, str)
             assert isinstance(local_bh, str)
-            assert store.has_kv_block(local_bh), f"Local hash '{local_bh}' from mapping not found in KV cache store"
+            assert store.has_kv_block(local_bh, group_idx=0), (
+                f"Local hash '{local_bh}' from group 0 not found in KV cache store"
+            )

@@ -61,6 +61,28 @@ _KVCAWARE_STRATEGY = OmegaConf.create(
 )
 
 
+def _registry(block_size: int = 16) -> dict:
+    return {
+        "status": "ok",
+        "metadata": {
+            "groups": [
+                {
+                    "group_idx": 0,
+                    "block_size": block_size,
+                    "spec_kind": "full_attention",
+                    "sliding_window": None,
+                }
+            ],
+            "scheduler_block_size": block_size,
+            "hash_block_size": block_size,
+            "mamba_cache_mode": None,
+            "partial_hash_hits_enabled": False,
+            "source_vllm_version": "0.26.0",
+            "source": "engine_core",
+        },
+    }
+
+
 @ray.remote
 class _MockServer:
     """Minimal Ray actor standing in for a vLLMHttpServer handle.
@@ -69,11 +91,44 @@ class _MockServer:
     (``get_server_address``, ``get_kv_events_endpoints``).
     """
 
+    def __init__(self, metadata=None):
+        self.metadata = metadata or _registry()
+
     def get_server_address(self):
         return ("127.0.0.1", 8000)
 
     def get_kv_events_endpoints(self):
         return None
+
+    def get_kv_cache_registry_metadata(self):
+        return self.metadata
+
+
+@ray.remote
+class _LegacyMockServer:
+    def get_server_address(self):
+        return ("127.0.0.1", 8000)
+
+    def get_kv_events_endpoints(self):
+        return None
+
+    def get_kv_cache_registry_metadata(self):
+        return {
+            "status": "unsupported",
+            "source_vllm_version": "0.21.0",
+        }
+
+
+@ray.remote
+class _FailingMetadataServer:
+    def get_server_address(self):
+        return ("127.0.0.1", 8000)
+
+    def get_kv_events_endpoints(self):
+        return None
+
+    def get_kv_cache_registry_metadata(self):
+        raise RuntimeError("metadata RPC failed")
 
 
 def _mk(*ids: str) -> dict:
@@ -88,7 +143,7 @@ def ray_runtime():
     ray.shutdown()
 
 
-def _router_config():
+def _router_config(*, legacy_single_group_fallback: bool = False):
     """Build a rollout-shaped config carrying the kvcaware ``router_config`` node.
 
     Mirrors the production path: ``get_router_handle`` reads ``router_strategy``
@@ -100,7 +155,10 @@ def _router_config():
     return OmegaConf.create(
         {
             "router_strategy": "kvcaware",
-            "router_config": _KVCAWARE_STRATEGY,
+            "router_config": OmegaConf.merge(
+                _KVCAWARE_STRATEGY,
+                {"legacy_single_group_fallback": legacy_single_group_fallback},
+            ),
         }
     )
 
@@ -177,5 +235,33 @@ class TestKVCAwareEndToEnd:
         assert status["strategies"] == [{"type": "KVCacheAwareStrategy", "weight": 1.0}]
         assert set(status["servers"]) == {"s0", "s1"}
         assert status["route_calls"] == 0
+        assert status["cache_group_registry_ready"] is True
+        assert status["cache_group_count"] == 1
         ray.get(handle.acquire_server.remote("r1", [1, 2, 3]))
         assert ray.get(handle.get_status.remote())["route_calls"] == 1
+
+    def test_i06_metadata_conflict_fails_closed(self, ray_runtime):
+        servers = {
+            "s0": _MockServer.remote(_registry(16)),
+            "s1": _MockServer.remote(_registry(32)),
+        }
+        handle = get_router_handle(servers, _router_config())
+        status = ray.get(handle.get_status.remote())
+        assert status["cache_group_registry_ready"] is False
+        assert status["cache_group_count"] == 0
+
+    @pytest.mark.parametrize("server_cls", [_LegacyMockServer, _FailingMetadataServer])
+    def test_i07_unsupported_or_failing_metadata_fails_closed(self, ray_runtime, server_cls):
+        handle = get_router_handle({"s0": server_cls.remote()}, _router_config())
+        status = ray.get(handle.get_status.remote())
+        assert status["cache_group_registry_ready"] is False
+        assert status["cache_group_count"] == 0
+
+    def test_i08_unsupported_metadata_enters_legacy_pending_only_when_enabled(self, ray_runtime):
+        handle = get_router_handle(
+            {"s0": _LegacyMockServer.remote()},
+            _router_config(legacy_single_group_fallback=True),
+        )
+        status = ray.get(handle.get_status.remote())
+        assert status["legacy_single_group_fallback"] == "pending"
+        assert status["cache_group_registry_ready"] is False

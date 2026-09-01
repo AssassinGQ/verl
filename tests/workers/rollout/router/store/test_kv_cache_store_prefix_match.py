@@ -19,7 +19,7 @@ from __future__ import annotations
 import pytest
 
 from verl.workers.rollout.router.kvcaware.store.kv_cache_store import KVCacheStore
-from verl.workers.rollout.router.kvcaware.types import Layer
+from verl.workers.rollout.router.kvcaware.types import KVCacheGroupMetadata, Layer
 from verl.workers.rollout.router.kvcaware.utils.hash import get_prefix_hashes_incremental
 
 pytestmark = [pytest.mark.ut, pytest.mark.cpu]
@@ -38,6 +38,11 @@ def _store_with_block_size() -> KVCacheStore:
 def _hashes(prompt_ids: list[int]) -> list[str]:
     """Prefix hashes for ``prompt_ids`` as the store keys them (str)."""
     hashes, _ = get_prefix_hashes_incremental(prompt_ids, BLOCK_SIZE, SEED, 0, SEED)
+    return [str(h) for h in hashes]
+
+
+def _hashes_with_size(prompt_ids: list[int], block_size: int) -> list[str]:
+    hashes, _ = get_prefix_hashes_incremental(prompt_ids, block_size, SEED, 0, SEED)
     return [str(h) for h in hashes]
 
 
@@ -142,3 +147,62 @@ def test_isolated_later_block_is_not_credited() -> None:
     # rep_a caches only unrelated hashes; prompt's H1 has no rep_a → chain
     # breaks immediately → 0.0 hit.
     assert store.get_layer_prefix_hit_rate("rep_a", _hashes(prompt), Layer.GPU) == 0.0
+
+
+def test_group_identity_and_common_shortest_prefix() -> None:
+    prompt = list(range(16))
+    hashes = _hashes(prompt)
+    store = KVCacheStore()
+    store.install_cache_group_registry(
+        [
+            KVCacheGroupMetadata(0, BLOCK_SIZE, "full_attention"),
+            KVCacheGroupMetadata(1, BLOCK_SIZE, "mamba"),
+        ]
+    )
+    store.add_blocks("rep_a", hashes, group_idx=0)
+    store.add_blocks("rep_a", hashes[:4], group_idx=1)
+
+    assert store.get_gpu_prefix_hit_rate("rep_a", {0: hashes, 1: hashes}) == 0.5
+    store.remove_blocks("rep_a", hashes[:4], group_idx=1)
+    assert store.get_gpu_prefix_hit_rate("rep_a", {0: hashes, 1: hashes}) == 0.0
+    assert store.get_layer_prefix_hit_rate("rep_a", hashes, Layer.GPU) == 1.0
+
+
+def test_different_block_sizes_align_to_lcm_boundary() -> None:
+    prompt = list(range(24))
+    hashes_4 = _hashes_with_size(prompt, 4)
+    hashes_6 = _hashes_with_size(prompt, 6)
+    store = KVCacheStore()
+    store.install_cache_group_registry(
+        [
+            KVCacheGroupMetadata(0, 4, "sliding_window", 4096),
+            KVCacheGroupMetadata(1, 6, "full_attention"),
+        ]
+    )
+    store.add_blocks("rep_a", hashes_4[:5], group_idx=0)
+    store.add_blocks("rep_a", hashes_6[:3], group_idx=1)
+
+    # query=24; matched tokens=(20, 18), both align to 12 at the LCM boundary.
+    assert store.get_gpu_prefix_hit_rate("rep_a", {0: hashes_4, 1: hashes_6}) == 0.5
+    assert store.get_gpu_prefix_hit_rate("rep_a", {0: hashes_4}) == 0.0
+
+
+def test_registry_validation_fails_closed_and_clear_preserves_registry() -> None:
+    metadata = [
+        KVCacheGroupMetadata(0, 4, "full_attention"),
+        KVCacheGroupMetadata(1, 4, "mamba"),
+    ]
+    store = KVCacheStore()
+    store.install_cache_group_registry(metadata)
+    generation = store.cache_group_registry_generation()
+    store.add_blocks("rep_a", ["h0"], group_idx=0)
+    store.add_blocks("rep_a", ["h1"], group_idx=1)
+
+    store.clear_replica("rep_a")
+    assert store.cache_group_registry_ready()
+    assert store.get_cache_group_metadata() == tuple(metadata)
+    assert not store.replicas_by_block
+
+    assert not store.validate_observed_group_metadata([KVCacheGroupMetadata(1, 8, "mamba")])
+    assert not store.cache_group_registry_ready()
+    assert store.cache_group_registry_generation() > generation

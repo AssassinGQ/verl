@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING
 from ..config.strategy import KVCAwareStrategyConfig
 from ..insight import emitter
 from ..logging import get_router_logger
-from ..types import Layer, MetricKey, OverloadMode, SlowCut
+from ..types import Layer, MetricKey, OverloadMode, PrefixHashChain, SlowCut
 from ..utils.prefix_cache import resolve_prefix_hashes
 from .registry import StrategyRegistry
 
@@ -434,11 +434,11 @@ class KVCacheAwareStrategy:
                 scores[top] = STICKY_TOP_SCORE
                 return scores
             # Hash-resolving slow_cuts share one resolution across all replicas.
-            gpu_hash_strs = resolve_prefix_hashes(prompt_ids or [], request_id, store)
+            gpu_hash_chain = resolve_prefix_hashes(prompt_ids or [], request_id, store)
             if self.slow_cut == SlowCut.PREFIX_LOAD_AWARE:
-                return self._prefix_load_aware(store, replicas, gpu_hash_strs)
+                return self._prefix_load_aware(store, replicas, gpu_hash_chain)
             if self.slow_cut == SlowCut.CAPACITY_TOKEN_AWARE:
-                return self._capacity_token_scores(store, replicas, request_id, prompt_ids or [], gpu_hash_strs)
+                return self._capacity_token_scores(store, replicas, request_id, prompt_ids or [], gpu_hash_chain)
             raise ValueError(f"Unknow slowcut type {self.slow_cut}")
         finally:
             emitter.on_route(time.perf_counter() - t0)
@@ -447,7 +447,7 @@ class KVCacheAwareStrategy:
         self,
         store: DataStore,
         replicas: list[ReplicaInfo],
-        gpu_hash_strs: list[str],
+        gpu_hash_chain: PrefixHashChain | None,
     ) -> list[float]:
         """Prefix-cache + blended-load combined score (``slow_cut=prefix-load-aware``).
 
@@ -469,7 +469,7 @@ class KVCacheAwareStrategy:
             load = self._compute_load(kv_usage, running, waiting, inflight)
             loads[replica.replica_id] = load
             s_load = 1.0 - load
-            s_cache, gpu_hit = self._cache_score(store, replica, gpu_hash_strs)
+            s_cache, gpu_hit = self._cache_score(store, replica, gpu_hash_chain)
             if emitter.enabled():
                 emitter.on_score(replica.replica_id, {"load": load, "s_cache": s_cache})
             score = self.alpha * s_cache + (1 - self.alpha) * s_load
@@ -492,20 +492,23 @@ class KVCacheAwareStrategy:
         self,
         store: DataStore,
         replica: ReplicaInfo,
-        hash_strs: list[str],
+        hash_chain: PrefixHashChain | None,
     ) -> tuple[float, float]:
         """Three-layer weighted prefix-cache hit score ∈ [0, 1].
 
             S_cache = w_gpu·gpu_hit + w_cpu·cpu_hit + w_ssd·ssd_hit
 
-        ``hash_strs`` is the caller-computed prefix-hash chain (shared across
-        replicas, per-request cached) so the per-replica cost is just the index
-        walk. CPU/SSD return 0.0 today (see ``KVCacheStore.get_layer_prefix_hit_rate``).
+        ``hash_chain`` is computed once per request and shared across
+        replicas. CPU/SSD return 0.0 until their indexes become group-aware.
         Returns ``(s_cache, gpu_hit)`` so the caller logs gpu_hit without re-querying.
         """
-        gpu_hit = store.get_layer_prefix_hit_rate(replica.replica_id, hash_strs, Layer.GPU)
-        cpu_hit = store.get_layer_prefix_hit_rate(replica.replica_id, hash_strs, Layer.CPU)
-        ssd_hit = store.get_layer_prefix_hit_rate(replica.replica_id, hash_strs, Layer.SSD)
+        legacy_hashes = list(hash_chain.hashes) if hash_chain is not None else []
+        if hash_chain is not None and hasattr(store, "get_gpu_prefix_hit_rate"):
+            gpu_hit = store.get_gpu_prefix_hit_rate(replica.replica_id, hash_chain)
+        else:
+            gpu_hit = store.get_layer_prefix_hit_rate(replica.replica_id, legacy_hashes, Layer.GPU)
+        cpu_hit = store.get_layer_prefix_hit_rate(replica.replica_id, legacy_hashes, Layer.CPU)
+        ssd_hit = store.get_layer_prefix_hit_rate(replica.replica_id, legacy_hashes, Layer.SSD)
         w = self.layer_weights
         s_cache = w[Layer.GPU] * gpu_hit + w[Layer.CPU] * cpu_hit + w[Layer.SSD] * ssd_hit
         return s_cache, gpu_hit
@@ -533,7 +536,7 @@ class KVCacheAwareStrategy:
         replicas: list[ReplicaInfo],
         request_id: str | None,
         prompt_ids: list[int],
-        gpu_hash_strs: list[str],
+        gpu_hash_chain: PrefixHashChain | None,
     ) -> list[float]:
         """Capacity-gated token routing (discrete: winner=STICKY_TOP_SCORE, rest 0).
 
@@ -565,7 +568,7 @@ class KVCacheAwareStrategy:
             inflight = store.get_metric(replica.replica_id, MetricKey.INFLIGHT_COUNT) or 0
             inflight_tokens = store.get_metric(replica.replica_id, MetricKey.INFLIGHT_TOKENS) or 0
             active_sessions = store.get_metric(replica.replica_id, MetricKey.ACTIVE_SESSIONS) or 0
-            s_cache, gpu_hit = self._cache_score(store, replica, gpu_hash_strs)
+            s_cache, gpu_hit = self._cache_score(store, replica, gpu_hash_chain)
             avail = cap * (1.0 - kv_perc)
             need = plen * (1.0 - gpu_hit)
             remaining = avail - need

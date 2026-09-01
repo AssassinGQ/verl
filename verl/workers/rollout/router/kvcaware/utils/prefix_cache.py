@@ -12,12 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Per-request incremental cache: skip re-hashing the unchanged prefix across turns."""
+"""Per-request checkpointing for the common fine-grained prefix hash chain."""
 
 from __future__ import annotations
 
 from typing import Any
 
+from ..types import PrefixHashChain
 from .hash import get_prefix_hashes_incremental
 
 _PREFIX_HASH_KEY = "prefix_hashes"
@@ -27,33 +28,58 @@ def resolve_prefix_hashes(
     prompt_ids: list[int],
     request_id: str | None,
     store: Any,
-) -> list[str]:
-    """Return ``str(h)`` for each full-block chained prefix hash of ``prompt_ids``.
-
-    With a ``request_id``, the ``(parent_hash, len(hash_strs))`` checkpoint is
-    memoized in the per-request store so only appended blocks are re-hashed on
-    later turns. Assumes multi-turn prompts are append-only; a shrunk prompt
-    triggers a full recompute. Returns ``[]`` when ``block_size`` is unknown.
-    """
-    block_size = store.get_block_size()
-    if not block_size or block_size <= 0:
-        return []
+) -> PrefixHashChain | None:
+    """Return the registry-generation-bound token-only prefix hash chain."""
+    if hasattr(store, "is_cache_group_registry_ready"):
+        if not store.is_cache_group_registry_ready():
+            return None
+        registry = store.get_cache_group_registry()
+        if registry is None:
+            return None
+        hash_block_size = registry.hash_block_size
+        generation = store.get_cache_group_registry_generation()
+    else:
+        # Narrow compatibility for non-production strategy test providers.
+        hash_block_size = store.get_block_size()
+        generation = 0
+    if not hash_block_size or hash_block_size <= 0:
+        return None
 
     cached = store.get_per_request(request_id, _PREFIX_HASH_KEY) if request_id else None
-    if cached and len(prompt_ids) // block_size >= len(cached["hash_strs"]):
-        # cached is the live store row (get returns a reference, not a copy):
-        # the in-place extend + parent update persist, and get() already touched
-        # LRU recency — no write-back needed.
-        tail, new_parent = get_prefix_hashes_incremental(
-            prompt_ids, block_size, cached["parent_hash"], len(cached["hash_strs"])
-        )
-        cached["hash_strs"].extend([str(h) for h in tail])
-        cached["parent_hash"] = new_parent
-        return cached["hash_strs"]
+    if (
+        not cached
+        or cached.get("generation") != generation
+        or cached.get("hash_block_size") != hash_block_size
+        or len(prompt_ids) // hash_block_size < len(cached.get("hashes", ()))
+    ):
+        cached = None
 
-    # full recompute (miss / shrink)
-    hashes, parent = get_prefix_hashes_incremental(prompt_ids, block_size, 0, 0)
-    hash_strs = [str(h) for h in hashes]
+    if cached is not None:
+        tail, parent = get_prefix_hashes_incremental(
+            prompt_ids,
+            hash_block_size,
+            cached["parent_hash"],
+            len(cached["hashes"]),
+        )
+        hashes = (*cached["hashes"], *(str(value) for value in tail))
+    else:
+        values, parent = get_prefix_hashes_incremental(prompt_ids, hash_block_size, 0, 0)
+        hashes = tuple(str(value) for value in values)
+
     if request_id:
-        store.set_per_request(request_id, _PREFIX_HASH_KEY, {"hash_strs": hash_strs, "parent_hash": parent})
-    return hash_strs
+        store.set_per_request(
+            request_id,
+            _PREFIX_HASH_KEY,
+            {
+                "generation": generation,
+                "hash_block_size": hash_block_size,
+                "hashes": hashes,
+                "parent_hash": parent,
+            },
+        )
+    return PrefixHashChain(
+        prompt_token_count=len(prompt_ids),
+        hash_block_size=hash_block_size,
+        hashes=hashes,
+        registry_generation=generation,
+    )

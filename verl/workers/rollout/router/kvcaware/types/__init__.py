@@ -14,10 +14,48 @@
 
 """Shared types, imported by many internal modules."""
 
+from .cache_group import (
+    FULL_ATTENTION,
+    KNOWN_SPEC_KINDS,
+    MAMBA,
+    SLIDING_WINDOW,
+    CacheScope,
+    KVCacheEventObservation,
+    KVCacheGroupMetadata,
+    KVCacheRegistryMetadata,
+    PrefixHashChain,
+    VLLMCacheCapabilities,
+    get_vllm_cache_capabilities,
+    normalize_spec_kind,
+    resolve_registry_metadata,
+    validate_registry,
+)
 from .emit_spec import EMIT_SPECS, EmitKey
 from .layer import Layer
 from .metric_spec import METRIC_SPECS, MetricKey
 from .overload_mode import OverloadMode
 from .slow_cut import SlowCut
 
-__all__ = ["EmitKey", "EMIT_SPECS", "Layer", "MetricKey", "METRIC_SPECS", "OverloadMode", "SlowCut"]
+__all__ = [
+    "CacheScope",
+    "EmitKey",
+    "EMIT_SPECS",
+    "FULL_ATTENTION",
+    "KNOWN_SPEC_KINDS",
+    "KVCacheEventObservation",
+    "KVCacheGroupMetadata",
+    "KVCacheRegistryMetadata",
+    "Layer",
+    "MAMBA",
+    "MetricKey",
+    "METRIC_SPECS",
+    "OverloadMode",
+    "PrefixHashChain",
+    "SLIDING_WINDOW",
+    "SlowCut",
+    "VLLMCacheCapabilities",
+    "get_vllm_cache_capabilities",
+    "normalize_spec_kind",
+    "resolve_registry_metadata",
+    "validate_registry",
+]
