@@ -35,8 +35,9 @@ class KVCacheEvent:
         parent_block_hash: Parent block hash — single value shared by all
                            block_hashes in a BlockStored event.
         token_ids: Pre-chopped block token bytes (``list[bytes]``, only present
-                   in BlockStored events).  Each element is one full block
-                   encoded as uint32 big-endian (4 bytes per token).
+                   in BlockStored events). Each element is one full event span
+                   encoded as uint32 big-endian (4 bytes per token). Sparse
+                   groups may carry fewer block hashes than token chunks.
         block_size: Block size (only present in BlockStored events).
         group_idx: KV cache group that owns the block.
         extra_keys: Additional block-identity keys, for example multimodal inputs.

@@ -26,7 +26,7 @@ from ..config.collector import CollectorConfig
 from ..insight import WriteEvent, WriteKind, emitter
 from ..logging import get_router_logger
 from ..store.data_store import DataStore
-from ..types import EmitKey, MetricKey
+from ..types import EmitKey, Layer, MetricKey
 from .decoder import Decoder, KVCacheUpdate, MetricsUpdate, StickyUpdate
 from .transport.base import Transport
 
@@ -116,6 +116,8 @@ class Collector:
 
         def handler(raw_data: bytes | str, node_id: str) -> None:
             """Handler: decode and dispatch to the right store write path."""
+            if hasattr(self._decoder, "set_cache_group_registry"):
+                self._decoder.set_cache_group_registry(self._data_store.get_cache_group_registry())
             result = self._decoder.decode(raw_data, node_id)
             if isinstance(result, KVCacheUpdate):
                 self._write_kv_update(result)
@@ -150,16 +152,22 @@ class Collector:
 
     def _write_kv_update(self, update: KVCacheUpdate) -> None:
         """Write KVCacheUpdate via DataStore, then emit a periodic kv-events tally."""
-        if update.block_size is not None:
-            self._data_store.set_block_size(update.block_size)
+        accept_gpu_adds = True
+        for observation in update.observed_group_metadata:
+            if not self._data_store.observe_kv_event(update.node_id, observation):
+                accept_gpu_adds = False
+                logger.warning(
+                    f"KV event metadata from node {update.node_id} is not valid for the cache-group registry"
+                )
+                break
         if update.clear_all:
             self._data_store.clear_kv_node(update.node_id)
-        for layer, hashes in update.remove_blocks.items():
+        for (layer, group_idx), hashes in update.remove_blocks.items():
             if hashes:
-                self._data_store.remove_kv_blocks(update.node_id, hashes, layer=layer)
-        for layer, hashes in update.add_blocks.items():
-            if hashes:
-                self._data_store.add_kv_blocks(update.node_id, hashes, layer=layer)
+                self._data_store.remove_kv_blocks(update.node_id, hashes, layer=layer, group_idx=group_idx)
+        for (layer, group_idx), hashes in update.add_blocks.items():
+            if hashes and (layer != Layer.GPU or accept_gpu_adds):
+                self._data_store.add_kv_blocks(update.node_id, hashes, layer=layer, group_idx=group_idx)
 
         # Tally for periodic summary — observe BlockStored/BlockRemoved flow.
         n_added = sum(len(v) for v in update.add_blocks.values())

@@ -58,6 +58,7 @@ class KVCAwareConfig:
     strategies: list[StrategyConfig]  # required, no default
     collector: CollectorConfig = field(default_factory=lambda: _DEFAULT_COLLECTOR)
     cache_store: CacheStoreConfig = field(default_factory=lambda: _DEFAULT_CACHE_STORE)
+    legacy_single_group_fallback: bool = False
 
     @classmethod
     def from_config(cls, cfg: DictConfig | dict) -> KVCAwareConfig:
@@ -85,6 +86,7 @@ class KVCAwareConfig:
             {
                 "collector": OmegaConf.structured(CollectorConfig),
                 "cache_store": OmegaConf.structured(CacheStoreConfig),
+                "legacy_single_group_fallback": False,
             }
         )
         kwargs_for_merge = OmegaConf.create(cfg)
@@ -116,9 +118,11 @@ class KVCAwareConfig:
         if isinstance(config_obj, dict):
             collector_cfg = config_obj.get("collector") or CollectorConfig()
             cache_store_cfg = config_obj.get("cache_store") or CacheStoreConfig()
+            legacy_fallback = bool(config_obj.get("legacy_single_group_fallback", False))
         else:
             collector_cfg = getattr(config_obj, "collector", None) or CollectorConfig()
             cache_store_cfg = getattr(config_obj, "cache_store", None) or CacheStoreConfig()
+            legacy_fallback = bool(getattr(config_obj, "legacy_single_group_fallback", False))
 
         # ── Step 2: parse strategies (polymorphic list) ────────────
         if strategies_raw is None:
@@ -130,6 +134,7 @@ class KVCAwareConfig:
             strategies=strategies,
             collector=collector_cfg,
             cache_store=cache_store_cfg,
+            legacy_single_group_fallback=legacy_fallback,
         )
         result.validate()
         return result

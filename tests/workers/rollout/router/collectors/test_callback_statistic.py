@@ -466,6 +466,6 @@ class TestCollectorEmitsToInsight:
         from verl.workers.rollout.router.kvcaware.types import Layer
 
         collector = Collector(CallbackTransport(_FakeBalancer()), InflightDecoder())
-        collector._write_kv_update(KVCacheUpdate(node_id="s0", remove_blocks={Layer.GPU: ["h1", "h2", "h3"]}))
+        collector._write_kv_update(KVCacheUpdate(node_id="s0", remove_blocks={(Layer.GPU, 0): ["h1", "h2", "h3"]}))
 
         assert self._rl.calls == [("counter", "kv_evictions", 3, {"replica": "s0"})]

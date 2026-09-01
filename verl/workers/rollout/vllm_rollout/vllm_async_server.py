@@ -46,6 +46,10 @@ from verl.utils.tracking import RLInsightLogger
 from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
+from verl.workers.rollout.router.kvcaware.types import (
+    get_vllm_cache_capabilities,
+    resolve_registry_metadata,
+)
 from verl.workers.rollout.utils import (
     get_max_position_embeddings,
     get_vision_placeholder_token_ids,
@@ -181,6 +185,11 @@ class vLLMHttpServer:
         self._server_address = ray.util.get_node_ip_address().strip("[]")
         self._server_port = None
         self._kv_events_endpoints = None
+        self._kv_cache_group_metadata = None
+        self._kv_cache_registry_result = {
+            "status": "unsupported",
+            "source_vllm_version": str(_VLLM_VERSION),
+        }
 
         # used for controlling vllm server profiler
         profiler_config = self.config.profiler
@@ -227,6 +236,65 @@ class vLLMHttpServer:
         Returns list [endpoint, replay_endpoint] or None.
         """
         return self._kv_events_endpoints
+
+    def get_kv_cache_group_metadata(self):
+        """Compatibility getter for finalized physical group metadata."""
+        return self._kv_cache_group_metadata
+
+    def get_kv_cache_registry_metadata(self):
+        """Return explicit discovery status plus the complete cache registry."""
+        return self._kv_cache_registry_result
+
+    async def _fetch_kv_cache_group_metadata(self, engine_client, vllm_config=None) -> None:
+        """Cache a version-adapted complete registry after EngineCore startup."""
+        source_version = str(_VLLM_VERSION)
+        capabilities = get_vllm_cache_capabilities(source_version)
+        if not capabilities.supports_group_metadata:
+            self._kv_cache_group_metadata = None
+            self._kv_cache_registry_result = {
+                "status": "unsupported",
+                "source_vllm_version": source_version,
+            }
+            return
+        try:
+            groups = await engine_client.engine_core.call_utility_async("get_kv_cache_group_metadata")
+            config = vllm_config or getattr(engine_client, "vllm_config", None)
+            parallel_config = getattr(config, "parallel_config", None)
+            for field in (
+                "data_parallel_size",
+                "decode_context_parallel_size",
+                "prefill_context_parallel_size",
+            ):
+                value = getattr(parallel_config, field, 1) if parallel_config is not None else 1
+                if value not in (None, 1):
+                    raise ValueError(f"{field}={value} is unsupported by cache-aware routing")
+            cache_config = getattr(config, "cache_config", None)
+            prefix_caching_enabled = bool(getattr(cache_config, "enable_prefix_caching", True))
+            configured_hash_size = getattr(cache_config, capabilities.hash_config_field, None)
+            mamba_cache_mode = getattr(cache_config, "mamba_cache_mode", None)
+            registry = resolve_registry_metadata(
+                groups,
+                source_vllm_version=source_version,
+                prefix_caching_enabled=prefix_caching_enabled,
+                configured_hash_block_size=configured_hash_size,
+                mamba_cache_mode=mamba_cache_mode,
+                partial_event_capable=capabilities.supports_partial_events,
+            )
+            payload = registry.as_dict()
+            self._kv_cache_group_metadata = payload["groups"]
+            self._kv_cache_registry_result = {
+                "status": "ok",
+                "metadata": payload,
+                "source_vllm_version": source_version,
+            }
+        except Exception as exc:  # noqa: BLE001
+            self._kv_cache_group_metadata = None
+            self._kv_cache_registry_result = {
+                "status": "error",
+                "source_vllm_version": source_version,
+                "error_type": type(exc).__name__,
+            }
+            logger.warning(f"Failed to fetch KV-cache registry metadata from EngineCore: {exc}")
 
     def get_rollout_config(self):
         """Get the RolloutConfig (e.g. max_num_seqs, max_model_len).
@@ -483,6 +551,7 @@ class vLLMHttpServer:
             kwargs["disable_log_stats"] = engine_args.disable_log_stats
 
         engine_client = AsyncLLM.from_vllm_config(vllm_config=vllm_config, usage_context=usage_context, **kwargs)
+        await self._fetch_kv_cache_group_metadata(engine_client, vllm_config)
 
         # Don't keep the dummy data in memory
         await engine_client.reset_mm_cache()

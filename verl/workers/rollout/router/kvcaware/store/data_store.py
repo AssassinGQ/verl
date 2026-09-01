@@ -18,7 +18,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..types import Layer, MetricKey
+from ..types import (
+    KVCacheEventObservation,
+    KVCacheGroupMetadata,
+    KVCacheRegistryMetadata,
+    Layer,
+    MetricKey,
+    PrefixHashChain,
+)
 from .kv_cache_store import KVCacheStore
 from .per_replica_store import PerReplicaStore
 from .per_request_store import PerRequestStore
@@ -113,7 +120,7 @@ class DataStore:
         Returns:
             Block size in tokens, or None if not yet learned.
         """
-        return self._kv.block_size
+        return self._kv.get_group_block_size(0) or self._kv.block_size
 
     def set_block_size(self, size: int) -> None:
         """Set block size (learned from first BlockStored event).
@@ -124,7 +131,9 @@ class DataStore:
         if self._kv.block_size is None:
             self._kv.block_size = size
 
-    def add_kv_blocks(self, node_id: str, block_hashes: list[str], layer: Layer = Layer.GPU) -> None:
+    def add_kv_blocks(
+        self, node_id: str, block_hashes: list[str], layer: Layer = Layer.GPU, group_idx: int = 0
+    ) -> None:
         """Add KV cache blocks to a node.
 
         Args:
@@ -132,9 +141,11 @@ class DataStore:
             block_hashes: List of local prefix hashes to add.
             layer: Cache layer (``Layer.GPU``/``Layer.CPU``/``Layer.SSD``).
         """
-        self._kv.add_blocks(node_id, block_hashes, layer=layer)
+        self._kv.add_blocks(node_id, block_hashes, layer=layer, group_idx=group_idx)
 
-    def remove_kv_blocks(self, node_id: str, block_hashes: list[str], layer: Layer = Layer.GPU) -> None:
+    def remove_kv_blocks(
+        self, node_id: str, block_hashes: list[str], layer: Layer = Layer.GPU, group_idx: int = 0
+    ) -> None:
         """Remove KV cache blocks from a node.
 
         Args:
@@ -142,7 +153,7 @@ class DataStore:
             block_hashes: List of local prefix hashes to remove.
             layer: Cache layer (``Layer.GPU``/``Layer.CPU``/``Layer.SSD``).
         """
-        self._kv.remove_blocks(node_id, block_hashes, layer=layer)
+        self._kv.remove_blocks(node_id, block_hashes, layer=layer, group_idx=group_idx)
 
     def clear_kv_node(self, node_id: str) -> None:
         """Clear all KV cache blocks for a node.
@@ -160,9 +171,51 @@ class DataStore:
         """Return True if node_id appears in at least one cached block."""
         return any(node_id in replicas for replicas in self._kv.replicas_by_block.values())
 
-    def has_kv_block(self, block_hash: str) -> bool:
+    def has_kv_block(self, block_hash: str, group_idx: int = 0) -> bool:
         """Return True if block_hash is present in the cache index."""
-        return block_hash in self._kv.replicas_by_block
+        return (group_idx, block_hash) in self._kv.replicas_by_block
+
+    def reset_cache_group_registry(self, replica_ids: list[str], legacy_fallback_enabled: bool) -> None:
+        self._kv.reset_registry_discovery(replica_ids, legacy_fallback_enabled)
+
+    def begin_legacy_single_group_fallback(self, source_versions: list[str | None]) -> None:
+        self._kv.begin_legacy_fallback(source_versions)
+
+    def install_cache_group_registry(self, metadata: KVCacheRegistryMetadata | list[KVCacheGroupMetadata]) -> None:
+        """Install a complete scheduler-provided cache-group registry."""
+        self._kv.install_cache_group_registry(metadata)
+
+    def invalidate_cache_group_registry(self) -> None:
+        """Mark group-aware GPU routing unavailable."""
+        self._kv.invalidate_cache_group_registry()
+
+    def is_cache_group_registry_ready(self) -> bool:
+        return self._kv.cache_group_registry_ready()
+
+    def get_cache_group_registry_generation(self) -> int:
+        return self._kv.cache_group_registry_generation()
+
+    def get_cache_group_metadata(self) -> tuple[KVCacheGroupMetadata, ...]:
+        return self._kv.get_cache_group_metadata()
+
+    def get_cache_group_registry(self) -> KVCacheRegistryMetadata | None:
+        return self._kv.get_cache_group_registry()
+
+    def get_cache_group_registry_status(self) -> dict[str, object]:
+        return self._kv.get_registry_status()
+
+    def get_group_block_size(self, group_idx: int) -> int | None:
+        return self._kv.get_group_block_size(group_idx)
+
+    def observe_kv_event(self, node_id: str, observation: KVCacheEventObservation) -> bool:
+        return self._kv.observe_event(node_id, observation)
+
+    def validate_observed_group_metadata(
+        self,
+        metadata: list[KVCacheEventObservation | KVCacheGroupMetadata],
+        node_id: str = "",
+    ) -> bool:
+        return self._kv.validate_observed_group_metadata(metadata, node_id)
 
     # ── KV cache prefix hit rate queries ────────────────────────────────
 
@@ -188,6 +241,10 @@ class DataStore:
             Hit rate 0.0–1.0.
         """
         return self._kv.get_layer_prefix_hit_rate(node_id, hash_strs, layer)
+
+    def get_gpu_prefix_hit_rate(self, node_id: str, chain: PrefixHashChain | dict[int, list[str]]) -> float:
+        """Query the GPU prefix hit common to all registered cache groups."""
+        return self._kv.get_gpu_prefix_hit_rate(node_id, chain)
 
     # ── KV-cache load (load signal) ─────────────────────────────────────
 

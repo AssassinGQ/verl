@@ -27,7 +27,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
 
-from ...types import Layer
+from ...types import CacheScope, KVCacheEventObservation, Layer
 
 
 @dataclass
@@ -40,25 +40,29 @@ class KVCacheUpdate:
 
     Attributes:
         node_id: Target endpoint identifier.
-        add_blocks: layer → block hashes accumulated to add.
-        remove_blocks: layer → block hashes accumulated to remove.
+        add_blocks: (layer, group_idx) → block hashes accumulated to add.
+        remove_blocks: (layer, group_idx) → block hashes accumulated to remove.
         clear_all: If True, clear all blocks for this node.
-        block_size: Block size learned from the first BlockStored (None until then).
+        block_size: Deprecated compatibility field; event spans are observations only.
+        observed_group_metadata: Group configuration fields observed in
+            BlockStored events, retained for validation against the complete
+            scheduler-provided registry; event spans never replace physical metadata.
     """
 
     node_id: str
-    add_blocks: dict[Layer, list[str]] = field(default_factory=dict)
-    remove_blocks: dict[Layer, list[str]] = field(default_factory=dict)
+    add_blocks: dict[CacheScope, list[str]] = field(default_factory=dict)
+    remove_blocks: dict[CacheScope, list[str]] = field(default_factory=dict)
     clear_all: bool = False
     block_size: int | None = None
+    observed_group_metadata: list[KVCacheEventObservation] = field(default_factory=list)
 
-    def add(self, layer: Layer, block_hashes: list[str]) -> None:
-        """Fold stored blocks into ``add_blocks`` under ``layer``."""
-        self.add_blocks.setdefault(layer, []).extend(block_hashes)
+    def add(self, layer: Layer, block_hashes: list[str], group_idx: int = 0) -> None:
+        """Fold stored blocks into ``add_blocks`` under a cache scope."""
+        self.add_blocks.setdefault((layer, group_idx), []).extend(block_hashes)
 
-    def remove(self, layer: Layer, block_hashes: list[str]) -> None:
-        """Fold removed blocks into ``remove_blocks`` under ``layer``."""
-        self.remove_blocks.setdefault(layer, []).extend(block_hashes)
+    def remove(self, layer: Layer, block_hashes: list[str], group_idx: int = 0) -> None:
+        """Fold removed blocks into ``remove_blocks`` under a cache scope."""
+        self.remove_blocks.setdefault((layer, group_idx), []).extend(block_hashes)
 
     def clear(self) -> None:
         """Mark the replica for a full block clear."""
@@ -67,6 +71,10 @@ class KVCacheUpdate:
     def set_block_size(self, size: int) -> None:
         """Set the learned block size (first BlockStored wins; set by the decoder)."""
         self.block_size = size
+
+    def observe_group_metadata(self, metadata: KVCacheEventObservation) -> None:
+        """Record event metadata for validation against the scheduler registry."""
+        self.observed_group_metadata.append(metadata)
 
 
 @dataclass

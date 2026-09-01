@@ -35,7 +35,7 @@ from conftest import NODE_ID, VLLM_MODEL, ZMQ_REPLAY_PORT, ZMQ_SUB_PORT, send_in
 from verl.workers.rollout.router.kvcaware.collectors.manager import CollectorManager
 from verl.workers.rollout.router.kvcaware.config.collector import CollectorConfig
 from verl.workers.rollout.router.kvcaware.store.data_store import DataStore
-from verl.workers.rollout.router.kvcaware.types import Layer
+from verl.workers.rollout.router.kvcaware.utils.prefix_cache import resolve_prefix_hashes
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -85,6 +85,15 @@ def _make_provider(node_id: str) -> CollectorManager:
     )
 
 
+def _legacy_store() -> DataStore:
+    """Explicitly assert this Qwen3 fixture is one Full Attention group."""
+    store = DataStore()
+    store.clear_kv_node(NODE_ID)
+    store.reset_cache_group_registry([NODE_ID], legacy_fallback_enabled=True)
+    store.begin_legacy_single_group_fallback(["0.21.0"])
+    return store
+
+
 # ── Tests ─────────────────────────────────────────────────────────────────
 
 
@@ -106,14 +115,15 @@ class TestGpuPrefixHitRateWithRealService:
         prompt_long = (
             "The history of artificial intelligence began in the 1950s and has evolved dramatically since then"
         )
-        prompt_short = "The history of artificial intelligence began in the 1950s"
 
         long_ids = _get_token_ids(vllm_kv_service, VLLM_MODEL, prompt_long)
-        short_ids = _get_token_ids(vllm_kv_service, VLLM_MODEL, prompt_short)
+        assert len(long_ids) > 17, f"Long prompt must span a full cache block, got {len(long_ids)} tokens"
+        short_ids = long_ids[:17]
         assert len(short_ids) < len(long_ids), (
             f"Short prompt should have fewer tokens than long, got short={len(short_ids)}, long={len(long_ids)}"
         )
 
+        store = _legacy_store()
         provider = _make_provider(vllm_kv_service)
         provider.start()
         time.sleep(5.0)
@@ -121,15 +131,9 @@ class TestGpuPrefixHitRateWithRealService:
         time.sleep(8.0)
         provider.stop()
 
-        store = DataStore()
-        hit = store.get_layer_prefix_hit_rate(NODE_ID, short_ids, Layer.GPU)
-
-        if hit == 0.0:
-            pytest.skip(
-                f"Short prompt has {len(short_ids)} tokens — fewer than block_size "
-                f"or no full block formed; cannot assert prefix hit rate"
-            )
-
+        chain = resolve_prefix_hashes(short_ids, None, store)
+        assert chain is not None
+        hit = store.get_gpu_prefix_hit_rate(NODE_ID, chain)
         assert hit == 1.0, f"Expected hit_rate=1.0 for prefix match, got {hit}"
 
     def test_prefix_hit_rate_returns_node_id_key(self, vllm_kv_service):
@@ -146,6 +150,7 @@ class TestGpuPrefixHitRateWithRealService:
         prompt_ids = _get_token_ids(vllm_kv_service, VLLM_MODEL, prompt)
         assert len(prompt_ids) > 0, "Should have token IDs for the prompt"
 
+        store = _legacy_store()
         provider = _make_provider(vllm_kv_service)
         provider.start()
         time.sleep(5.0)
@@ -153,7 +158,8 @@ class TestGpuPrefixHitRateWithRealService:
         time.sleep(8.0)
         provider.stop()
 
-        store = DataStore()
-        hit = store.get_layer_prefix_hit_rate(NODE_ID, prompt_ids, Layer.GPU)
+        chain = resolve_prefix_hashes(prompt_ids, None, store)
+        assert chain is not None
+        hit = store.get_gpu_prefix_hit_rate(NODE_ID, chain)
 
         assert 0.0 <= hit <= 1.0, f"Hit rate should be in [0.0, 1.0], got {hit}"

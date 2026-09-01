@@ -40,11 +40,22 @@ from verl.workers.rollout.router.kvcaware.strategies.kvc_aware import (
     StrategyError,
 )
 from verl.workers.rollout.router.kvcaware.strategies.routing import RoutingStrategy
-from verl.workers.rollout.router.kvcaware.types import Layer, MetricKey, OverloadMode, SlowCut
+from verl.workers.rollout.router.kvcaware.types import Layer, MetricKey, OverloadMode, PrefixHashChain, SlowCut
 
 pytestmark = [pytest.mark.ut, pytest.mark.cpu]
 # --------------------------------------------------------------------------- #
 # Helpers
+
+
+def _chain(values: list[int]) -> PrefixHashChain:
+    return PrefixHashChain(
+        prompt_token_count=len(values),
+        hash_block_size=1,
+        hashes=tuple(str(value) for value in values),
+        registry_generation=0,
+    )
+
+
 # --------------------------------------------------------------------------- #
 
 
@@ -133,6 +144,9 @@ class FakeRouteDataProvider:
         if layer == Layer.GPU:
             return entry.get("gpu_hit_pct", 0) / 100.0
         return entry.get("tiers", {}).get(layer, 0.0)
+
+    def get_gpu_prefix_hit_rate(self, replica_id: str, hashes_by_group: dict[int, list[str]]) -> float:
+        return self._data.get(replica_id, {}).get("gpu_hit_pct", 0) / 100.0
 
     def kv_cache_load(self, replica_id: str) -> float | None:
         # Unit tests key the load signal on kv_cache_usage_perc (no kv-events /
@@ -498,7 +512,7 @@ class TestKVCAwareCacheScore:
         """
         strat = _strat()
         provider = FakeRouteDataProvider({"rep": {"gpu_hit_pct": 80, "tiers": {"cpu": 0.6, "ssd": 0.2}}})
-        s_cache, _ = strat._cache_score(provider, ReplicaInfo("rep"), PROMPT_IDS)
+        s_cache, _ = strat._cache_score(provider, ReplicaInfo("rep"), _chain(PROMPT_IDS))
         assert s_cache == pytest.approx(0.70)
 
     def test_gpu_only_when_tiers_zero(self):
@@ -509,7 +523,7 @@ class TestKVCAwareCacheScore:
         """
         strat = _strat()
         provider = FakeRouteDataProvider({"rep": {"gpu_hit_pct": 80, "tiers": {}}})
-        s_cache, _ = strat._cache_score(provider, ReplicaInfo("rep"), PROMPT_IDS)
+        s_cache, _ = strat._cache_score(provider, ReplicaInfo("rep"), _chain(PROMPT_IDS))
         assert s_cache == pytest.approx(0.56)
 
     def test_no_hit_returns_zero(self):
@@ -520,7 +534,7 @@ class TestKVCAwareCacheScore:
         """
         strat = _strat()
         provider = FakeRouteDataProvider({"rep": {"tiers": {"cpu": 0.0, "ssd": 0.0}}})
-        s_cache, _ = strat._cache_score(provider, ReplicaInfo("rep"), PROMPT_IDS)
+        s_cache, _ = strat._cache_score(provider, ReplicaInfo("rep"), _chain(PROMPT_IDS))
         assert s_cache == pytest.approx(0.0)
 
     def test_custom_weights_respected(self):
@@ -531,7 +545,7 @@ class TestKVCAwareCacheScore:
         """
         strat = _strat(layer_weights={"gpu": 0.5, "cpu": 0.3, "ssd": 0.2})
         provider = FakeRouteDataProvider({"rep": {"gpu_hit_pct": 100, "tiers": {"cpu": 1.0, "ssd": 1.0}}})
-        s_cache, _ = strat._cache_score(provider, ReplicaInfo("rep"), PROMPT_IDS)
+        s_cache, _ = strat._cache_score(provider, ReplicaInfo("rep"), _chain(PROMPT_IDS))
         assert s_cache == pytest.approx(1.0)
 
 
@@ -1025,7 +1039,7 @@ class TestFallbackModes:
 
     def test_inflight_tie_keeps_pool_order(self):
         """slow_cut=least-inflight tie-break: equal inflight → first replica in pool order."""
-        strat = _strat(slow_cut=SlowCut.LEAST_INFLIGHT)
+        strat = _strat(slow_cut=SlowCut.LEAST_INFLIGHT, first_bind_window=0)
         provider = FakeRouteDataProvider(
             {"rep_a": {"inflight_count": 3}, "rep_b": {"inflight_count": 3}},
         )
@@ -1168,15 +1182,17 @@ class TestCapacityTokenAware:
                 "rep_a": {"num_gpu_blocks": 100, "kv_cache_usage_perc": 0.5, "gpu_hit_pct": 100},
                 "rep_b": {"num_gpu_blocks": 100, "kv_cache_usage_perc": 0.2, "gpu_hit_pct": 0},
             },
+            sticky={"r1": "rep_gone"},
         )
         provider_b = FakeRouteDataProvider(
             {
                 "rep_a": {"num_gpu_blocks": 100, "kv_cache_usage_perc": 0.5, "gpu_hit_pct": 100},
                 "rep_b": {"num_gpu_blocks": 100, "kv_cache_usage_perc": 0.2, "gpu_hit_pct": 0},
             },
+            sticky={"r1": "rep_gone"},
         )
-        s0 = self._cap_strat(alpha=0.0).score(PROMPT_IDS, provider_a, _replicas("rep_a", "rep_b"))
-        s1 = self._cap_strat(alpha=1.0).score(PROMPT_IDS, provider_b, _replicas("rep_a", "rep_b"))
+        s0 = self._cap_strat(alpha=0.0).score(PROMPT_IDS, provider_a, _replicas("rep_a", "rep_b"), "r1")
+        s1 = self._cap_strat(alpha=1.0).score(PROMPT_IDS, provider_b, _replicas("rep_a", "rep_b"), "r1")
         assert s0 == s1  # winner independent of alpha
 
     # ── is_overloaded (overload_mode=SIMPLE uses raw kv_perc > load_threshold) ──

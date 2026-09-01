@@ -24,6 +24,7 @@ and unit-testable, satisfying the ``RequestLoadBalancer`` Protocol.
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
 from typing import Any, Callable, Optional
 
 import ray
@@ -38,6 +39,7 @@ from .strategies import (
     StrategyRegistry,
     route,
 )
+from .types import KVCacheRegistryMetadata, validate_registry
 
 logger = get_router_logger("balancer")
 
@@ -135,19 +137,32 @@ class KVCAwareBalancer:
         return self._resolve_rollout_config_int("max_num_batched_tokens", default)
 
     def _init_manager(self) -> None:
-        """Resolve per-server endpoints from Ray actor handles, then start collectors.
-
-        Non-actor handles (plain strings in unit tests) have no
-        ``get_server_address``; discovery is skipped and collectors fall back
-        to configured/default endpoints.
-        """
+        """Resolve endpoints, discover one trusted registry, then start collectors."""
         collection_names = sorted({name for cfg in self._config.strategies for name in cfg.collector_names})
         server_addresses: dict[str, str] = {}
         kv_event_endpoints: dict[str, list[str]] = {}
         addr_futures = []
         ep_futures = []
         active_replicas = []
+        metadata_futures: dict[str, Any] = {}
+        discovery_results: dict[str, Mapping[str, Any]] = {}
+        self._store.reset_cache_group_registry(
+            list(self._servers),
+            self._config.legacy_single_group_fallback,
+        )
+
         for replica_id, handle in self._servers.items():
+            if hasattr(handle, "get_kv_cache_registry_metadata"):
+                metadata_futures[replica_id] = handle.get_kv_cache_registry_metadata.remote()
+            else:
+                discovery_results[replica_id] = {
+                    "status": "error",
+                    "error_type": "MissingRegistryGetter",
+                }
+                logger.warning(
+                    f"server '{replica_id}' has no complete cache-registry getter; "
+                    "GPU prefix scoring will remain disabled"
+                )
             if not hasattr(handle, "get_server_address"):
                 logger.warning(
                     f"server '{replica_id}' handle has no get_server_address remote "
@@ -165,10 +180,53 @@ class KVCAwareBalancer:
                 server_addresses[replica_id] = f"{ip}:{port}"
                 if endpoints is None:
                     continue
-                # Pad verl's [sub, replay] to the [sub, replay, publisher, topic] ZMQTransport expects.
                 if len(endpoints) == 2:
                     endpoints = [*endpoints, "zmq", "kv-events"]
                 kv_event_endpoints[replica_id] = endpoints
+
+        for replica_id, future in metadata_futures.items():
+            try:
+                raw = ray.get(future)
+                if not isinstance(raw, Mapping) or raw.get("status") not in ("ok", "unsupported", "error"):
+                    raise ValueError("registry getter returned an invalid status payload")
+                discovery_results[replica_id] = raw
+            except Exception as exc:  # noqa: BLE001
+                discovery_results[replica_id] = {
+                    "status": "error",
+                    "error_type": type(exc).__name__,
+                }
+
+        try:
+            statuses = [result["status"] for result in discovery_results.values()]
+            if len(statuses) != len(self._servers):
+                raise ValueError("registry discovery did not cover every configured replica")
+            if statuses and all(status == "ok" for status in statuses):
+                registries = [
+                    validate_registry(KVCacheRegistryMetadata.from_raw(result["metadata"]))
+                    for result in discovery_results.values()
+                ]
+                expected = registries[0]
+                if any(registry != expected for registry in registries[1:]):
+                    raise ValueError("replica cache registries or version capabilities do not match")
+                self._store.install_cache_group_registry(expected)
+                logger.info(
+                    "Installed KV-cache registry from EngineCore metadata: "
+                    f"group_count={len(expected.groups)}, scheduler_block_size={expected.scheduler_block_size}, "
+                    f"hash_block_size={expected.hash_block_size}, partial={expected.partial_hash_hits_enabled}"
+                )
+            elif statuses and all(status == "unsupported" for status in statuses):
+                versions = [result.get("source_vllm_version") for result in discovery_results.values()]
+                self._store.begin_legacy_single_group_fallback(versions)
+                logger.warning(
+                    "All replicas report cache-registry metadata unsupported; "
+                    f"legacy_single_group_fallback={self._config.legacy_single_group_fallback}"
+                )
+            else:
+                raise ValueError(f"mixed or failed registry discovery statuses={statuses}")
+        except Exception as exc:  # noqa: BLE001
+            self._store.invalidate_cache_group_registry()
+            logger.warning(f"cache-registry discovery failed closed: {type(exc).__name__}: {exc}")
+
         self._manager = CollectorManager(
             self._config.collector,
             collection_names,
@@ -207,12 +265,22 @@ class KVCAwareBalancer:
 
     def get_status(self) -> dict:
         """Construction + routing snapshot for debugging."""
+        registry_status = self._store.get_cache_group_registry_status()
         return {
             "servers": list(self._servers.keys()),
             "manager": type(self._manager).__name__,
             "strategies": [{"type": type(s).__name__, "weight": w} for s, w in self._strategies],
             "route_calls": self._route_calls,
             "sticky_size": self._store.sticky_status()["size"],
+            "cache_group_registry_ready": registry_status["ready"],
+            "cache_group_registry_source": registry_status["source"],
+            "cache_group_registry_generation": registry_status["generation"],
+            "cache_group_count": registry_status["group_count"],
+            "cache_group_scheduler_block_size": registry_status["scheduler_block_size"],
+            "cache_group_hash_block_size": registry_status["hash_block_size"],
+            "cache_group_partial_hash_hits_enabled": registry_status["partial_hash_hits_enabled"],
+            "legacy_single_group_fallback": registry_status["legacy_single_group_fallback"],
+            "cache_group_source_vllm_version": registry_status["source_vllm_version"],
         }
 
     def release_server(self, server_id: str, prompt_len: int = 0, request_id: str | None = None) -> None:

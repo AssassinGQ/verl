@@ -150,6 +150,7 @@ def _load_config(
     tensor_parallel_size: int,
     gateway_count: int,
     max_concurrent_sessions: int,
+    simulated_runner_fqn: str | None,
     tool_image: str | None,
     run_timeout: int,
     gpu_memory_utilization: float,
@@ -277,9 +278,16 @@ def _load_config(
     runner_name = next(iter(af.agent_runners.keys()))
     runner_cfg = af.agent_runners[runner_name]
     runner_cfg.max_concurrent_sessions = max_concurrent_sessions
-    if tool_image:
-        runner_cfg.runner_kwargs.tool_image = tool_image
-    runner_cfg.runner_kwargs.run_timeout = run_timeout
+    if simulated_runner_fqn:
+        # E2E tests can exercise the real gateway/router/model path without
+        # provisioning an external sandbox. The injected callable implements
+        # uni-agent's AgentRunner protocol and reports its own reward.
+        runner_cfg.runner_fqn = simulated_runner_fqn
+        runner_cfg.runner_kwargs = {}
+    else:
+        if tool_image:
+            runner_cfg.runner_kwargs.tool_image = tool_image
+        runner_cfg.runner_kwargs.run_timeout = run_timeout
 
     config.trainer.nnodes = nnodes
     config.trainer.n_gpus_per_node = n_gpus_per_node
@@ -386,6 +394,7 @@ def run_inference(
     tensor_parallel_size: int,
     gateway_count: int,
     max_concurrent_sessions: int,
+    simulated_runner_fqn: str | None,
     tool_image: str | None,
     run_timeout: int,
     result_path: str | None,
@@ -433,6 +442,7 @@ def run_inference(
         tensor_parallel_size=tensor_parallel_size,
         gateway_count=gateway_count,
         max_concurrent_sessions=max_concurrent_sessions,
+        simulated_runner_fqn=simulated_runner_fqn,
         tool_image=tool_image,
         run_timeout=run_timeout,
         gpu_memory_utilization=gpu_memory_utilization,
@@ -545,6 +555,12 @@ def main():
     parser.add_argument("--n-gpus-per-node", type=int, default=8)
     parser.add_argument("--gateway-count", type=int, default=1)
     parser.add_argument("--max-concurrent-sessions", type=int, default=128)
+    parser.add_argument(
+        "--simulated-runner-fqn",
+        type=str,
+        default=None,
+        help="AgentRunner-protocol test double; when set, no external sandbox is created.",
+    )
     parser.add_argument("--tool-image", type=str, default=_DEFAULT_TOOL_IMAGE)
     parser.add_argument("--run-timeout", type=int, default=7200)
     parser.add_argument("--max-turns", type=int, default=100)
@@ -677,6 +693,7 @@ def main():
         tensor_parallel_size=args.tensor_parallel_size,
         gateway_count=args.gateway_count,
         max_concurrent_sessions=args.max_concurrent_sessions,
+        simulated_runner_fqn=args.simulated_runner_fqn,
         tool_image=args.tool_image,
         run_timeout=args.run_timeout,
         result_path=args.result_path,
